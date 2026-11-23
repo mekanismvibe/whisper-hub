@@ -8,14 +8,15 @@ services:
     container_name: whisper-hub
     restart: unless-stopped
     ports:
-      - "${WHUB_PORT:-8765}:8765"
+      # Host port only; the app listens on 8765 inside the container.
+      - "${WHUB_HTTP_PORT:-8765}:8765"
     environment:
       # Everything else is configured in the web UI after first-run setup.
       WHUB_DATA_DIR: /data
     volumes:
       - whisper-hub-data:/data
       # Model downloads survive container rebuilds.
-      - whisper-hub-models:/root/.cache/huggingface
+      - whisper-hub-models:/home/app/.cache/huggingface
     tmpfs:
       # Audio never touches disk. Uploads are held in memory anyway; this is defence in depth.
       - /tmp:size=256m,mode=1777
@@ -24,11 +25,11 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=4)"
+        - "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('WHUB_PORT', '8765'), timeout=4)"
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 120s
 
 volumes:
   whisper-hub-data:

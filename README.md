@@ -46,13 +46,18 @@ cloud, no audio files.
 ```bash
 # CPU
 docker run -d --name whisper-hub -p 8765:8765 -v whisper-hub-data:/data \
+  -v whisper-hub-models:/home/app/.cache/huggingface \
   --tmpfs /tmp --restart unless-stopped ghcr.io/mekanismvibe/whisper-hub:latest
 # NVIDIA GPU (needs the NVIDIA Container Toolkit)
 docker run -d --name whisper-hub --gpus all -p 8765:8765 -v whisper-hub-data:/data \
+  -v whisper-hub-models:/home/app/.cache/huggingface \
   --tmpfs /tmp --restart unless-stopped ghcr.io/mekanismvibe/whisper-hub:cuda
 
 docker exec whisper-hub cat /data/setup_token   # then open http://<server>:8765/setup?token=<token>
 ```
+
+The prebuilt images are `linux/amd64`. On ARM64, use the compose build below.
+The second volume keeps downloaded models across container upgrades.
 
 ### Docker (CPU)
 
@@ -71,7 +76,8 @@ docker compose exec whisper-hub cat /data/setup_token
 ```
 
 The log URL contains the container hostname. From the Docker host, replace it
-with `http://localhost:8765` and keep the `?token=…` part.
+with `http://localhost:8765` and keep the `?token=…` part. To publish a different
+host port, set `WHUB_HTTP_PORT` (e.g. `WHUB_HTTP_PORT=9000 docker compose up -d`).
 
 ### Docker (NVIDIA GPU)
 
@@ -91,6 +97,7 @@ git clone https://github.com/mekanismvibe/whisper-hub.git
 cd whisper-hub
 uv sync                 # CPU
 # uv sync --extra cuda  # NVIDIA wheels; the hub preloads cuBLAS/cuDNN itself
+# Without the cuda extra, a GPU host falls back to the CPU automatically.
 uv run whisper-hub
 ```
 
@@ -245,9 +252,9 @@ port and data directory are environment/CLI only.
 
 ## Optional Parakeet Ultra
 
-`uv sync --extra parakeet` installs Moondream's Photon runtime. For Docker,
-build with `--build-arg EXTRAS=parakeet` (or `EXTRAS=cuda,parakeet` for both
-extras). When the English engine is set to `parakeet`:
+`uv sync --extra parakeet` installs Moondream's Photon runtime together with the
+CUDA wheels Whisper needs. For Docker, build with `--build-arg EXTRAS=parakeet`.
+When the English engine is set to `parakeet`:
 
 - English audio is transcribed by Parakeet Ultra; other languages still use
   Whisper.

@@ -1,6 +1,7 @@
 .git
 .github
-.venv
+.venv*
+.e2e
 .pytest_cache
 .ruff_cache
 __pycache__

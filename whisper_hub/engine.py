@@ -339,6 +339,21 @@ def _run_hybrid_policy(
     )
 
 
+def _cuda_runtime_available() -> bool:
+    """CTranslate2 dlopens cuBLAS 12 and cuDNN 9 at first use; a GPU alone is not enough."""
+    import ctypes
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return True  # DLL names differ elsewhere; let CTranslate2 report problems itself
+    for soname in ("libcublas.so.12", "libcudnn.so.9"):
+        try:
+            ctypes.CDLL(soname)
+        except OSError:
+            return False
+    return True
+
+
 class WhisperModels:
     """Lazily load one or two CTranslate2 Whisper models and unload them on demand."""
 
@@ -360,7 +375,12 @@ class WhisperModels:
             import ctranslate2
 
             if ctranslate2.get_cuda_device_count() > 0:
-                return "cuda"
+                if _cuda_runtime_available():
+                    return "cuda"
+                logger.warning(
+                    "A CUDA GPU is present but cuBLAS 12 / cuDNN 9 are missing; using the CPU. "
+                    "Install them with 'uv sync --extra cuda' (or the :cuda image) to use the GPU."
+                )
         except Exception:  # pragma: no cover - optional CUDA support
             logger.debug("CUDA detection failed; using CPU", exc_info=True)
         return "cpu"

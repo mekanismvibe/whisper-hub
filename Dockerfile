@@ -23,12 +23,19 @@ RUN if [ -n "$EXTRAS" ]; then \
         pip install --no-cache-dir .; \
     fi
 
-RUN mkdir -p /data && chmod 700 /data
+# Run unprivileged; /data and the model cache belong to the app user.
+RUN useradd --create-home --uid 1000 app \
+    && mkdir -p /data /home/app/.cache/huggingface \
+    && chown -R app:app /data /home/app/.cache \
+    && chmod 700 /data
+USER app
+ENV HOME=/home/app
 VOLUME ["/data"]
 
 EXPOSE 8765
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=4)" || exit 1
+# start-period covers the first model download/load after setup.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('WHUB_PORT', '8765'), timeout=4)" || exit 1
 
 CMD ["whisper-hub"]

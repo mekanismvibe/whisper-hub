@@ -22,8 +22,10 @@ cuda = [
     "nvidia-cublas-cu12>=12,<13",
     "nvidia-cudnn-cu12>=9,<10",
 ]
+# Whisper still detects and translates, so Parakeet hosts need the CUDA 12 stack too.
 parakeet = [
     "moondream>=2.4.1",
+    "whisper-hub[cuda]",
 ]
 
 [dependency-groups]

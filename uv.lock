@@ -1985,6 +1985,8 @@ cuda = [
 ]
 parakeet = [
     { name = "moondream" },
+    { name = "nvidia-cublas-cu12" },
+    { name = "nvidia-cudnn-cu12" },
 ]
 
 [package.dev-dependencies]
@@ -2006,6 +2008,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "segno", specifier = ">=1.6" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "whisper-hub", extras = ["cuda"], marker = "extra == 'parakeet'" },
 ]
 provides-extras = ["cuda", "parakeet"]
 
