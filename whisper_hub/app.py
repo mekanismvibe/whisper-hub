@@ -13,6 +13,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any
 
 import segno
@@ -310,6 +311,14 @@ def _load_session_secret(data_dir: Path) -> str:
     return secret
 
 
+def _password_matches(app: FastAPI, password: str) -> bool:
+    expected = app.state.config.admin_password
+    if expected:
+        return constant_time_equals(password, expected)
+    stored = app.state.db.get_setting("admin_password_hash")
+    return bool(stored) and verify_password(password, stored or "")
+
+
 def _rotate_session_secret(data_dir: Path) -> str:
     secret = secrets.token_urlsafe(48)
     _write_private(data_dir / "session_secret", secret + "\n")
@@ -531,6 +540,7 @@ def create_app(
     app.state.legacy_migrated = legacy_migrated
     app.state.semaphore = asyncio.Semaphore(config.max_concurrency)
     app.state.login_limiter = LoginLimiter()
+    app.state.login_lock = asyncio.Lock()
     app.state.web_device_id = web_device["id"]
 
     app.add_middleware(
@@ -545,6 +555,25 @@ def create_app(
         BodyLimitMiddleware,
         get_limits=lambda: (app.state.config.max_upload_bytes, app.state.config.max_upload_mb),
     )
+
+    @app.middleware("http")
+    async def same_origin_only(request: Request, call_next):
+        # SameSite=Lax treats every port on a host as the same site, so on a homelab another
+        # service could forge admin requests. Refuse unsafe cross-origin browser requests.
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not request.url.path.startswith("/v1/"):
+            origin = request.headers.get("origin")
+            if origin and origin != "null":
+                if urlparse(origin).netloc.lower() != (request.headers.get("host") or "").lower():
+                    return JSONResponse(
+                        ApiError(403, "Cross-origin request refused.", code="cross_origin").body(),
+                        status_code=403,
+                    )
+            elif request.headers.get("sec-fetch-site") == "cross-site":
+                return JSONResponse(
+                    ApiError(403, "Cross-origin request refused.", code="cross_origin").body(),
+                    status_code=403,
+                )
+        return await call_next(request)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -749,7 +778,7 @@ def create_app(
         if not request.app.state.setup_required:
             raise ApiError(410, "Setup is already complete.", code="setup_complete")
         expected = request.app.state.setup_token
-        if not isinstance(token, str) or not expected or not secrets.compare_digest(token, expected):
+        if not isinstance(token, str) or not expected or not constant_time_equals(token, expected):
             raise ApiError(
                 403,
                 "Invalid or missing setup token. Open the setup URL printed in the server log.",
@@ -762,7 +791,7 @@ def create_app(
         required = bool(request.app.state.setup_required)
         expected = request.app.state.setup_token
         token_valid = bool(
-            required and token and expected and secrets.compare_digest(token, expected)
+            required and token and expected and constant_time_equals(token, expected)
         )
         return {
             "setup_required": required,
@@ -864,15 +893,14 @@ def create_app(
         password = payload.get("password")
         if not isinstance(password, str):
             raise ApiError(400, "Password is required.", code="invalid_password")
-        expected = request.app.state.config.admin_password
-        if expected:
-            valid = constant_time_equals(password, expected)
-        else:
-            stored = request.app.state.db.get_setting("admin_password_hash")
-            valid = bool(stored) and verify_password(password, stored or "")
-        if not valid:
-            limiter.record_failure(ip)
-            raise ApiError(401, "Incorrect password.", type_="authentication_error", code="invalid_password")
+        # One attempt at a time: parallel guesses would otherwise all pass the limiter
+        # before the first failure is recorded. scrypt runs off the event loop.
+        async with request.app.state.login_lock:
+            limiter.check(ip)
+            valid = await asyncio.to_thread(_password_matches, request.app, password)
+            if not valid:
+                limiter.record_failure(ip)
+                raise ApiError(401, "Incorrect password.", type_="authentication_error", code="invalid_password")
         limiter.record_success(ip)
         request.session.clear()
         request.session["admin"] = True
@@ -1143,14 +1171,27 @@ def create_app(
                 code="env_locked",
             )
         payload = await _json_body(request)
-        stored = request.app.state.db.get_setting("admin_password_hash") or ""
-        if not stored or not verify_password(str(payload.get("current_password") or ""), stored):
-            raise ApiError(401, "The current password is incorrect.", code="invalid_password")
+        limiter: LoginLimiter = request.app.state.login_limiter
+        key = "password-change:" + _client_ip(request)
+        async with request.app.state.login_lock:
+            limiter.check(key)
+            current_ok = await asyncio.to_thread(
+                _password_matches, request.app, str(payload.get("current_password") or "")
+            )
+            if not current_ok:
+                limiter.record_failure(key)
+                raise ApiError(401, "The current password is incorrect.", code="invalid_password")
+        limiter.record_success(key)
         try:
             password = validate_new_password(payload.get("new_password"), payload.get("confirm"))
         except ValueError as exc:
             raise ApiError(400, str(exc), code="invalid_password") from None
-        request.app.state.db.set_setting("admin_password_hash", hash_password(password))
+        hashed = await asyncio.to_thread(hash_password, password)
+        request.app.state.db.set_setting("admin_password_hash", hashed)
+        # A new password signs out every other session; this one is re-issued below.
+        request.app.state.session_secret = _rotate_session_secret(data_dir)
+        request.session.clear()
+        request.session["admin"] = True
         return {"ok": True}
 
     @admin.post("/logout-all")

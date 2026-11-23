@@ -111,6 +111,12 @@ class LoginLimiter:
 
     def record_failure(self, key: str) -> None:
         with self._lock:
+            if len(self._failures) > 10_000:
+                # Forget sources whose lockout ended long ago so the map cannot grow forever.
+                now = time.monotonic()
+                self._failures = {
+                    k: v for k, v in self._failures.items() if v[1] > now - self.max_seconds
+                }
             failures, _ = self._failures.get(key, (0, 0.0))
             failures += 1
             locked_until = 0.0
@@ -125,14 +131,17 @@ class LoginLimiter:
 
 
 def constant_time_equals(candidate: str, expected: str) -> bool:
-    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+    # surrogatepass: arbitrary client strings (lone surrogates, non-ASCII) must not raise.
+    return hmac.compare_digest(
+        candidate.encode("utf-8", "surrogatepass"), expected.encode("utf-8", "surrogatepass")
+    )
 
 
 def hash_password(password: str) -> str:
     """Scrypt hash in a self-describing format: ``scrypt$n$r$p$salt$hash``."""
     salt = secrets.token_bytes(16)
     derived = hashlib.scrypt(
-        password.encode("utf-8"),
+        password.encode("utf-8", "surrogatepass"),
         salt=salt,
         n=SCRYPT_N,
         r=SCRYPT_R,
@@ -156,7 +165,7 @@ def verify_password(password: str, encoded: str) -> bool:
         salt = base64.b64decode(salt_b64.encode("ascii"))
         expected = base64.b64decode(hash_b64.encode("ascii"))
         derived = hashlib.scrypt(
-            password.encode("utf-8"),
+            password.encode("utf-8", "surrogatepass"),
             salt=salt,
             n=int(n),
             r=int(r),

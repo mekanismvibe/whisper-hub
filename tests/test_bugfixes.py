@@ -96,3 +96,54 @@ def test_setup_finishes_when_model_is_pinned_by_env(tmp_path):
         done = client.post("/api/setup/finish", json={"token": token, "model": "medium", "english_engine": "whisper"})
         assert done.status_code == 200, done.text
         assert app.state.config.model == "tiny"
+
+
+def test_cross_origin_admin_requests_are_refused(admin: TestClient):
+    evil = {"Origin": "http://testserver:3000"}
+    assert admin.post("/api/admin/devices", json={"name": "x", "kind": "other"}, headers=evil).status_code == 403
+    same = {"Origin": "http://testserver"}
+    assert admin.post("/api/admin/devices", json={"name": "x", "kind": "other"}, headers=same).status_code == 200
+    # Device clients (no browser) are unaffected.
+    assert admin.post("/v1/audio/transcriptions", headers={"Origin": "http://elsewhere"}).status_code != 403
+
+
+def test_login_limiter_cannot_be_raced(client: TestClient):
+    import concurrent.futures
+
+    def guess(_):
+        return client.post("/api/login", json={"password": "wrong-guess"}).status_code
+
+    with concurrent.futures.ThreadPoolExecutor(12) as pool:
+        codes = list(pool.map(guess, range(12)))
+    assert codes.count(401) <= 5 and codes.count(429) >= 7
+
+
+def test_password_change_signs_out_other_sessions(tmp_path):
+    from whisper_hub.app import create_app
+    from whisper_hub.config import Config
+
+    from .conftest import FakeEngine
+
+    config = Config(data_dir=tmp_path / "data", admin_password=None, model="tiny", preload=False)
+    app = create_app(config, engine=FakeEngine(), engine_factory=lambda cfg: FakeEngine())
+    with TestClient(app) as first, TestClient(app) as second:
+        token = app.state.setup_token
+        first.post("/api/setup/password", json={"token": token, "password": "old-password", "confirm": "old-password"})
+        assert first.post("/api/setup/finish", json={"token": token, "model": "tiny"}).status_code == 200
+        assert second.post("/api/login", json={"password": "old-password"}).status_code == 200
+        changed = first.post(
+            "/api/admin/password",
+            json={"current_password": "old-password", "new_password": "new-password", "confirm": "new-password"},
+        )
+        assert changed.status_code == 200
+        assert first.get("/api/admin/devices").status_code == 200, "the changing session stays signed in"
+        assert second.get("/api/admin/devices").status_code == 401, "other sessions are signed out"
+
+
+def test_json_endpoints_reject_large_bodies(client: TestClient):
+    big = "x" * (2 * 1024 * 1024)
+    assert client.post("/api/login", content=big, headers={"content-type": "application/json"}).status_code == 413
+
+
+def test_non_ascii_setup_token_is_not_a_500(client: TestClient):
+    assert client.get("/api/setup/status", params={"token": "é"}).status_code == 200

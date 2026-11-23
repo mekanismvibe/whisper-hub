@@ -10,6 +10,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from .errors import PayloadTooLarge
 
 OVERHEAD_ALLOWANCE = 1024 * 1024  # multipart headers and boundaries
+JSON_BODY_LIMIT = 1024 * 1024  # everything that is not an audio upload
+UPLOAD_PATHS = ("/v1/audio/", "/api/admin/web-transcribe")
 
 
 class BodyLimitMiddleware:
@@ -27,6 +29,8 @@ class BodyLimitMiddleware:
             return
 
         threshold, limit_mb = self._limits()
+        if not scope.get("path", "").startswith(UPLOAD_PATHS):
+            threshold = min(threshold, JSON_BODY_LIMIT)
         headers = {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope["headers"]}
         declared = headers.get("content-length")
         if declared:
@@ -126,6 +130,12 @@ class RotatingSessionMiddleware:
         from starlette.middleware.sessions import Session
 
         connection = HTTPConnection(scope)
+        forwarded = (connection.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+        # Secure when the browser reached us over HTTPS (directly or via a reverse proxy),
+        # so plain-HTTP LAN logins keep working.
+        flags = self.security_flags
+        if "secure" not in flags and (scope.get("scheme") == "https" or forwarded == "https"):
+            flags += "; secure"
         initial_session_was_empty = True
         signer = itsdangerous.TimestampSigner(str(self.get_secret()))
         if self.session_cookie in connection.cookies:
@@ -148,16 +158,17 @@ class RotatingSessionMiddleware:
                     headers.add_vary_header("Cookie")
                 if session.modified and session:
                     data = b64encode(json.dumps(session).encode("utf-8"))
-                    data = signer.sign(data)
+                    # Sign with the current key: the handler may just have rotated it.
+                    data = itsdangerous.TimestampSigner(str(self.get_secret())).sign(data)
                     header_value = (
                         f"{self.session_cookie}={data.decode('utf-8')}; path=/; "
-                        f"Max-Age={self.max_age}; {self.security_flags}"
+                        f"Max-Age={self.max_age}; {flags}"
                     )
                     headers.append("set-cookie", header_value)
                 elif session.modified and not initial_session_was_empty:
                     header_value = (
                         f"{self.session_cookie}=null; path=/; "
-                        f"expires=Thu, 01 Jan 1970 00:00:00 GMT; {self.security_flags}"
+                        f"expires=Thu, 01 Jan 1970 00:00:00 GMT; {flags}"
                     )
                     headers.append("set-cookie", header_value)
             await send(message)
