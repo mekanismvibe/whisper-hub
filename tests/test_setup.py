@@ -151,6 +151,7 @@ def test_setup_finish_validates_translation_models(tmp_path):
                 "model": "large-v3-turbo",
                 "translate_model": "",
                 "english_engine": "whisper",
+                "non_english": True,
             },
         )
         assert response.status_code == 400
@@ -220,5 +221,29 @@ def test_finish_requires_a_password_first(tmp_path):
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "password_required"
         assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 409
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_setup_wizard_can_enable_non_english(tmp_path):
+    client, _, _, token = _setup_app(tmp_path)
+    try:
+        client.post(
+            "/api/setup/password",
+            json={"token": token, "password": "setup-password-1", "confirm": "setup-password-1"},
+        )
+        response = client.post(
+            "/api/setup/finish",
+            json={
+                "token": token,
+                "model": "small",
+                "translate_model": "",
+                "english_engine": "whisper",
+                "non_english": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert client.app.state.config.non_english is True
+        assert client.get("/api/admin/settings").json()["values"]["non_english"] is True
     finally:
         client.__exit__(None, None, None)

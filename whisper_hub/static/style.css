@@ -2749,10 +2749,16 @@ details.details[open] {
 
 .field:has(> input[type="checkbox"]) {
   flex-direction: row;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 6px 10px;
 }
 
 .field:has(> input[type="checkbox"]) > label {
   order: 2;
+}
+
+.field:has(> input[type="checkbox"]) > .field-note {
+  order: 3;
+  flex-basis: 100%;
 }

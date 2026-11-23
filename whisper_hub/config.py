@@ -88,6 +88,7 @@ class Config:
     max_upload_mb: int = 100
     model_idle_unload_seconds: float = 0.0
     preload: bool = True
+    non_english: bool = False
     honor_client_language: bool = False
     lang_confidence: float = 0.5
     english_engine: str = "whisper"
@@ -166,6 +167,7 @@ class Config:
                 get("MODEL_IDLE_UNLOAD_SECONDS"), 0.0, "WHUB_MODEL_IDLE_UNLOAD_SECONDS"
             ),
             preload=_parse_bool(get("PRELOAD"), True),
+            non_english=_parse_bool(get("NON_ENGLISH"), False),
             honor_client_language=_parse_bool(get("HONOR_CLIENT_LANGUAGE"), False),
             lang_confidence=_parse_float(get("LANG_CONFIDENCE"), 0.5, "WHUB_LANG_CONFIDENCE"),
             english_engine=(get("ENGLISH_ENGINE") or "whisper").strip().lower(),

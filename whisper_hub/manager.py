@@ -90,6 +90,10 @@ class EngineManager:
         status.pop("swap_failed", None)
         status["device"] = getattr(self._engine, "device", None)
         status["compute_type"] = getattr(self._engine, "compute_type", None)
+        status["loaded_models"] = list(getattr(self._engine, "loaded_models", []) or [])
+        status["non_english"] = bool(
+            getattr(getattr(self._engine, "config", None), "non_english", False)
+        )
         return status
 
     def mark_ready(self) -> None:

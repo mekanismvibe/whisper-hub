@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from whisper_hub.config import Config
 from whisper_hub.engine import ParakeetModels, _warmup_parakeet, _warmup_whisper, run_policy
@@ -97,6 +98,13 @@ class FakeSpeechSource:
     def touch(self) -> None:
         pass
 
+    def load(self) -> None:
+        self.models_loaded = True
+
+    def unload(self) -> bool:
+        self.models_loaded = False
+        return True
+
 
 AUDIO = np.zeros(1600, dtype=np.float32)
 
@@ -113,6 +121,7 @@ def test_english_audio_is_transcribed_and_not_translated():
         language_hint="es",
         beam_size=5,
         honor_client_language=False,
+        non_english=True,
     )
 
     assert result.text == "hello there"
@@ -144,6 +153,7 @@ def test_non_english_audio_drops_transcription_and_runs_translation():
         language_hint=None,
         beam_size=3,
         honor_client_language=False,
+        non_english=True,
     )
 
     assert result.text == "the translated english text"
@@ -169,6 +179,7 @@ def test_language_hint_is_used_only_when_enabled():
         language_hint="es",
         beam_size=5,
         honor_client_language=True,
+        non_english=True,
     )
     assert primary.calls[0]["language"] == "es"
 
@@ -207,6 +218,7 @@ def test_low_confidence_non_english_is_transcribed_as_english():
         beam_size=5,
         honor_client_language=False,
         lang_confidence=0.5,
+        non_english=True,
     )
 
     assert result.task == "transcribe"
@@ -238,6 +250,7 @@ def test_low_confidence_without_english_support_still_translates():
         beam_size=5,
         honor_client_language=False,
         lang_confidence=0.5,
+        non_english=True,
     )
 
     assert result.task == "translate"
@@ -257,6 +270,7 @@ def test_english_audio_uses_parakeet_without_decoding_whisper_text():
         beam_size=5,
         honor_client_language=False,
         speech=speech,
+        non_english=True,
     )
 
     assert result.text == "hello from parakeet"
@@ -286,6 +300,7 @@ def test_non_english_audio_still_translates_with_whisper():
         beam_size=3,
         honor_client_language=False,
         speech=speech,
+        non_english=True,
     )
 
     assert result.text == "the translated english text"
@@ -316,6 +331,7 @@ def test_low_confidence_english_uses_parakeet():
         honor_client_language=False,
         lang_confidence=0.5,
         speech=speech,
+        non_english=True,
     )
 
     assert result.task == "transcribe"
@@ -339,6 +355,7 @@ def test_parakeet_error_falls_back_to_whisper(caplog):
         beam_size=5,
         honor_client_language=False,
         speech=speech,
+        non_english=True,
     )
 
     assert result.text == "hello fallback"
@@ -364,6 +381,7 @@ def test_translation_uses_its_own_beam_size():
         beam_size=5,
         translate_beam_size=2,
         honor_client_language=False,
+        non_english=True,
     )
 
     assert result.task == "translate"
@@ -382,6 +400,7 @@ def test_without_timestamps_reaches_whisper_transcribe_and_translate():
         beam_size=5,
         honor_client_language=False,
         without_timestamps=True,
+        non_english=True,
     )
     assert source.requests == [False]
     assert primary.calls[0]["without_timestamps"] is True
@@ -396,6 +415,7 @@ def test_without_timestamps_reaches_whisper_transcribe_and_translate():
         beam_size=5,
         honor_client_language=False,
         without_timestamps=True,
+        non_english=True,
     )
     assert translator.calls[0]["without_timestamps"] is True
 
@@ -496,7 +516,7 @@ def test_english_only_main_model_still_translates_non_english():
     translator = FakeWhisperModel("es", "translated text")
     source = FakeModelSource(EnglishOnlyModel(), translator)
     result = run_policy(source, np.zeros(16000, dtype=np.float32), prompt=None, language_hint=None,
-                        beam_size=5, honor_client_language=False)
+                        beam_size=5, honor_client_language=False, non_english=True)
     assert result.task == "translate" and result.text == "translated text"
     assert result.detected_language == "es"
 
@@ -505,7 +525,7 @@ def test_english_only_main_model_transcribes_english_itself():
     primary = EnglishOnlyModel()
     source = FakeModelSource(primary, FakeWhisperModel("en", "unused"))
     result = run_policy(source, np.zeros(16000, dtype=np.float32), prompt=None, language_hint=None,
-                        beam_size=5, honor_client_language=False)
+                        beam_size=5, honor_client_language=False, non_english=True)
     assert result.task == "transcribe" and result.text == "english only output"
 
 
@@ -513,7 +533,7 @@ def test_english_only_main_model_with_parakeet_does_not_crash():
     speech = FakeSpeechSource(FakeSpeechModel())
     source = FakeModelSource(EnglishOnlyModel(), FakeWhisperModel("en", "unused"))
     result = run_policy(source, np.zeros(16000, dtype=np.float32), prompt=None, language_hint=None,
-                        beam_size=5, honor_client_language=False, speech=speech)
+                        beam_size=5, honor_client_language=False, speech=speech, non_english=True)
     assert result.text == "hello from parakeet"
 
 
@@ -553,3 +573,248 @@ def test_swapped_engine_is_released_after_its_last_request():
     gate.set()
     worker.join(5)
     assert Models.unloaded == 1 and not engine.busy
+
+
+def test_english_only_never_detects_or_translates_and_forces_english():
+    primary = FakeWhisperModel("es", "texto en español")
+    translator = FakeWhisperModel("es", "SHOULD NOT APPEAR")
+    source = FakeModelSource(primary, translator)
+
+    result = run_policy(
+        source,
+        AUDIO,
+        prompt=None,
+        language_hint="es",
+        beam_size=5,
+        honor_client_language=True,
+    )
+
+    assert result.task == "transcribe"
+    assert result.detected_language == "en"
+    assert result.model == "primary-model"
+    assert primary.detect_calls == []
+    assert translator.calls == []
+    assert source.requests == [False]
+    assert primary.calls[0]["task"] == "transcribe"
+    assert primary.calls[0]["language"] == "en"
+    assert primary.calls[0]["initial_prompt"] is None
+
+
+def test_english_only_parakeet_never_touches_whisper():
+    primary = FakeWhisperModel("en", "SHOULD NOT APPEAR")
+    source = FakeModelSource(primary)
+    speech = FakeSpeechSource(FakeSpeechModel("hello from parakeet"))
+
+    result = run_policy(
+        source,
+        AUDIO,
+        prompt=None,
+        language_hint=None,
+        beam_size=5,
+        honor_client_language=False,
+        speech=speech,
+    )
+
+    assert result.text == "hello from parakeet"
+    assert result.detected_language == "en"
+    assert result.task == "transcribe"
+    assert source.requests == []
+    assert primary.detect_calls == []
+    assert primary.calls == []
+    assert speech.requests == 1
+
+
+def test_english_only_parakeet_failure_has_no_whisper_fallback():
+    speech = FakeSpeechSource(FakeSpeechModel(error=RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_policy(
+            None,
+            AUDIO,
+            prompt=None,
+            language_hint=None,
+            beam_size=5,
+            honor_client_language=False,
+            speech=speech,
+        )
+
+
+def test_english_only_whisper_loads_only_the_main_model():
+    from whisper_hub.engine import WhisperModels
+
+    config = Config(
+        model="small",
+        translate_model="large-v3",
+        english_engine="whisper",
+        device="cpu",
+    )
+    provider = WhisperModels(config)
+    loaded: list[str] = []
+    provider._load = lambda name: loaded.append(name) or FakeWhisperModel("en", "hello")
+
+    provider.load()
+
+    assert loaded == ["small"]
+    assert provider.loaded_models == ["small"]
+    with pytest.raises(RuntimeError):
+        provider.get_model(translate=True)
+
+
+def test_non_english_mode_loads_both_whisper_models():
+    from whisper_hub.engine import WhisperModels
+
+    config = Config(
+        model="small",
+        translate_model="large-v3",
+        english_engine="whisper",
+        device="cpu",
+        non_english=True,
+    )
+    provider = WhisperModels(config)
+    loaded: list[str] = []
+    provider._load = lambda name: loaded.append(name) or FakeWhisperModel("es", "hello")
+
+    provider.load()
+
+    assert loaded == ["small", "large-v3"]
+    assert provider.loaded_models == ["small", "large-v3"]
+
+
+def test_warmup_whisper_can_skip_detection():
+    model = FakeWhisperModel("en", "")
+
+    _warmup_whisper(model, detect=False)
+
+    assert model.detect_calls == []
+    assert len(model.calls) == 1
+    assert model.calls[0]["language"] == "en"
+    assert model.consumed == 1
+
+
+class ManagedSpeechSource(FakeSpeechSource):
+    """Parakeet source that tracks load/unload the way the real provider does."""
+
+    def __init__(self, model: FakeSpeechModel) -> None:
+        super().__init__(model)
+        self.models_loaded = False
+        self.unloaded = False
+        self.idle_seconds = 0.0
+
+    @property
+    def loaded_models(self) -> list[str]:
+        return ["parakeet-ultra"] if self.models_loaded else []
+
+    def load(self) -> None:
+        self.models_loaded = True
+
+    def unload(self) -> bool:
+        self.unloaded = True
+        self.models_loaded = False
+        return True
+
+
+def test_engine_without_whisper_models_loads_unloads_and_retires():
+    from whisper_hub.engine import WhisperEngine
+
+    speech = ManagedSpeechSource(FakeSpeechModel("hello"))
+    engine = WhisperEngine(
+        Config(model="small", english_engine="parakeet", device="cpu"), speech=speech
+    )
+
+    assert engine.models is None
+    assert engine.models_loaded is False
+    engine.load()
+    assert engine.models_loaded is True
+    assert engine.whisper_loaded is False
+    assert engine.parakeet_loaded is True
+    assert engine.loaded_models == ["parakeet-ultra"]
+    assert engine.idle_seconds == 0.0
+
+    engine.retire()
+    assert speech.unloaded is True
+    assert engine.models_loaded is False
+
+
+def test_translations_endpoint_returns_english_with_english_only_engine(tmp_path):
+    import io
+    import wave
+
+    from fastapi.testclient import TestClient
+
+    from whisper_hub.app import create_app
+    from whisper_hub.engine import WhisperEngine
+
+    from .conftest import ADMIN_PASSWORD, auth, create_and_pair
+
+    speech = FakeSpeechSource(FakeSpeechModel("hello there"))
+    engine = WhisperEngine(
+        Config(
+            admin_password=ADMIN_PASSWORD,
+            data_dir=tmp_path / "data",
+            model="small",
+            english_engine="parakeet",
+            preload=False,
+        ),
+        speech=speech,
+    )
+    assert engine.models is None
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x01\x00" * 16000)
+
+    app = create_app(Config(
+        admin_password=ADMIN_PASSWORD,
+        data_dir=tmp_path / "data",
+        model="small",
+        english_engine="parakeet",
+        preload=False,
+    ), engine=engine)
+    with TestClient(app) as client:
+        assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+        _, key, _ = create_and_pair(client)
+        response = client.post(
+            "/v1/audio/translations",
+            headers=auth(key),
+            files={"file": ("clip.wav", buffer.getvalue(), "audio/wav")},
+            data={"response_format": "verbose_json", "language": "es"},
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["text"] == "hello there"
+    assert body["task"] == "transcribe"
+    assert body["language"] == "english"
+    assert response.headers["X-Whub-Task"] == "transcribe"
+    assert speech.model.calls[0]["sample_rate"] == 16000
+
+
+def test_healthz_reports_parakeet_alone_as_loaded(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from whisper_hub.app import create_app
+    from whisper_hub.engine import WhisperEngine
+
+    config = Config(
+        data_dir=tmp_path / "data",
+        model="small",
+        english_engine="parakeet",
+        device="cpu",
+        preload=False,
+    )
+    speech = ManagedSpeechSource(FakeSpeechModel("hello"))
+    speech.load()
+    engine = WhisperEngine(config, speech=speech)
+    with TestClient(create_app(config, engine=engine)) as client:
+        body = client.get("/healthz").json()
+
+    assert body["non_english"] is False
+    assert body["models_loaded"] is True
+    assert body["ready"] is True
+    assert body["whisper_loaded"] is False
+    assert body["parakeet_loaded"] is True
+    assert body["loaded_models"] == ["parakeet-ultra"]
+    assert body["model_status"] == "ready"

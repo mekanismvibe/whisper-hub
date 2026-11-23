@@ -178,7 +178,7 @@ def _detector(models: ModelSource) -> Any | None:
 
 
 def run_policy(
-    models: ModelSource,
+    models: ModelSource | None,
     audio: Any,
     *,
     prompt: str | None,
@@ -189,6 +189,7 @@ def run_policy(
     speech: SpeechSource | None = None,
     translate_beam_size: int = 5,
     without_timestamps: bool = False,
+    non_english: bool = False,
 ) -> TranscriptionResult:
     """Detect the language, then transcribe English or translate everything else.
 
@@ -196,7 +197,22 @@ def run_policy(
     and transcribed by ``speech``; Whisper is only asked for text when that fails.
     ``without_timestamps`` drops timestamp tokens from Whisper output; callers may only
     set it when the response does not need segment times.
+
+    With ``non_english=False`` (the default) every clip is transcribed as English:
+    no language detection runs, nothing is translated, and Parakeet needs no Whisper
+    model at all.
     """
+    if not non_english:
+        return _run_english_only_policy(
+            models,
+            audio,
+            prompt=prompt,
+            beam_size=beam_size,
+            speech=speech,
+            without_timestamps=without_timestamps,
+        )
+    if models is None:
+        raise RuntimeError("non-English support needs a Whisper model")
     if speech is not None:
         return _run_hybrid_policy(
             models,
@@ -281,6 +297,67 @@ def run_policy(
         duration_s=getattr(active_info, "duration", None),
         segments=[_segment_dict(segment, index) for index, segment in enumerate(consumed)],
         model=active_model,
+    )
+
+
+def _run_english_only_policy(
+    models: ModelSource | None,
+    audio: Any,
+    *,
+    prompt: str | None,
+    beam_size: int,
+    speech: SpeechSource | None,
+    without_timestamps: bool,
+) -> TranscriptionResult:
+    """Transcribe every clip as English: no detection, no translation, no Whisper for Parakeet."""
+    if speech is not None:
+        try:
+            speech_model, speech_name = speech.get_model()
+            payload = speech_model.transcribe(
+                audio=audio, sample_rate=16000, timestamps="segment"
+            )
+            text = str(payload.get("text") or "").strip()
+            segments = payload.get("segments") or []
+            duration = payload.get("duration_seconds")
+            return TranscriptionResult(
+                text=text,
+                detected_language="en",
+                language_probability=None,
+                task="transcribe",
+                duration_s=float(duration) if duration is not None else _audio_duration(audio),
+                segments=[
+                    _parakeet_segment_dict(segment, index)
+                    for index, segment in enumerate(segments)
+                ],
+                model=speech_name,
+            )
+        except Exception as exc:
+            # Never log the audio or any transcript text: the exception type is enough.
+            logger.warning("parakeet failed (%s)", type(exc).__name__)
+            if models is None:
+                raise
+    if models is None:
+        raise RuntimeError("no speech model is configured")
+    model, model_name = models.get_model(translate=False)
+    segments, info = model.transcribe(
+        audio,
+        task="transcribe",
+        language="en",
+        vad_filter=True,
+        beam_size=beam_size,
+        condition_on_previous_text=False,
+        initial_prompt=prompt or None,
+        without_timestamps=without_timestamps,
+    )
+    consumed = list(segments)
+    return TranscriptionResult(
+        text="".join(getattr(segment, "text", "") for segment in consumed).strip(),
+        detected_language="en",
+        language_probability=getattr(info, "language_probability", None),
+        task="transcribe",
+        duration_s=getattr(info, "duration", None),
+        segments=[_segment_dict(segment, index) for index, segment in enumerate(consumed)],
+        model=model_name,
     )
 
 
@@ -442,14 +519,21 @@ def _cuda_runtime_available() -> bool:
     return True
 
 
-def _warmup_whisper(model: Any) -> None:
-    """Run one silent decode so the first real request does not pay the kernel warm-up."""
+def _warmup_whisper(model: Any, *, detect: bool = True) -> None:
+    """Run one silent decode so the first real request does not pay the kernel warm-up.
+
+    ``detect=False`` skips the language head entirely when the hub is English-only.
+    """
     try:
         silence = np.zeros(16000 * 30, dtype=np.float32)
-        if _is_multilingual(model):
+        if detect and _is_multilingual(model):
             model.detect_language(silence, vad_filter=False)
         # dictation is short: one second exercises the tokenizer/decoder too.
-        segments, _ = model.transcribe(silence[:16000], beam_size=1)
+        transcribe_options: dict[str, Any] = {"beam_size": 1}
+        if not detect:
+            # Force English so the decoder does not run its own language detection.
+            transcribe_options["language"] = "en"
+        segments, _ = model.transcribe(silence[:16000], **transcribe_options)
         list(segments)
     except Exception as exc:
         logger.warning(
@@ -518,6 +602,15 @@ class WhisperModels:
         return self._primary is not None
 
     @property
+    def loaded_models(self) -> list[str]:
+        names: list[str] = []
+        if self._primary is not None:
+            names.append(self._primary_name)
+        if self._translator is not None and self._translator_name not in names:
+            names.append(self._translator_name)
+        return names
+
+    @property
     def idle_seconds(self) -> float:
         return time.monotonic() - self._last_used
 
@@ -540,11 +633,13 @@ class WhisperModels:
             compute_type=self._compute_type,
             cpu_threads=self.config.cpu_threads,
         )
-        _warmup_whisper(model)
+        _warmup_whisper(model, detect=self.config.non_english)
         logger.info("loaded whisper model=%s in %.1fs", name, time.monotonic() - started)
         return model
 
     def get_model(self, *, translate: bool) -> tuple[TranscribeModel, str]:
+        if translate and not self.config.non_english:
+            raise RuntimeError("non-English support is disabled")
         with self._lock:
             self._last_used = time.monotonic()
             if translate and self._translator_name != self._primary_name:
@@ -560,7 +655,8 @@ class WhisperModels:
 
     def load(self) -> None:
         self.get_model(translate=False)
-        if self._translator_name != self._primary_name:
+        # English-only mode never translates, so the translation model stays unloaded.
+        if self.config.non_english and self._translator_name != self._primary_name:
             self.get_model(translate=True)
 
     def unload(self) -> bool:
@@ -604,6 +700,10 @@ class ParakeetModels:
     @property
     def models_loaded(self) -> bool:
         return self._model is not None
+
+    @property
+    def loaded_models(self) -> list[str]:
+        return [self.model_name] if self._model is not None else []
 
     @property
     def idle_seconds(self) -> float:
@@ -675,7 +775,13 @@ class WhisperEngine:
         speech: SpeechSource | None = None,
     ) -> None:
         self.config = config
-        self.models: ModelSource = models or WhisperModels(config)
+        if models is not None:
+            self.models: ModelSource | None = models
+        elif config.non_english or config.english_engine != "parakeet":
+            self.models = WhisperModels(config)
+        else:
+            # English-only Parakeet needs no Whisper model: not even for detection.
+            self.models = None
         if speech is None and config.english_engine == "parakeet":
             speech = ParakeetModels(config)
         self.speech = speech
@@ -689,22 +795,42 @@ class WhisperEngine:
 
     @property
     def models_loaded(self) -> bool:
-        return self.models.models_loaded or bool(self.speech and self.speech.models_loaded)
+        return bool(
+            (self.models is not None and self.models.models_loaded)
+            or (self.speech is not None and self.speech.models_loaded)
+        )
+
+    @property
+    def whisper_loaded(self) -> bool:
+        return bool(self.models is not None and self.models.models_loaded)
 
     @property
     def parakeet_loaded(self) -> bool:
         return bool(self.speech and self.speech.models_loaded)
 
     @property
+    def loaded_models(self) -> list[str]:
+        names: list[str] = []
+        for source in (self.models, self.speech):
+            for name in getattr(source, "loaded_models", []) or []:
+                if name not in names:
+                    names.append(name)
+        return names
+
+    @property
     def idle_seconds(self) -> float:
-        idle = float(getattr(self.models, "idle_seconds", 0.0))
+        idle: list[float] = []
+        if self.models is not None:
+            idle.append(float(getattr(self.models, "idle_seconds", 0.0)))
         if self.speech is not None:
-            idle = min(idle, self.speech.idle_seconds)
-        return idle
+            idle.append(float(self.speech.idle_seconds))
+        return min(idle) if idle else 0.0
 
     @property
     def device(self) -> str:
-        return getattr(self.models, "device", self.config.device)
+        return getattr(self.models, "device", None) or getattr(
+            self.speech, "device", self.config.device
+        )
 
     @property
     def compute_type(self) -> str | None:
@@ -732,7 +858,8 @@ class WhisperEngine:
                 without_timestamps=without_timestamps,
             )
         finally:
-            self.models.touch()
+            if self.models is not None:
+                self.models.touch()
             touch = getattr(self.speech, "touch", None)
             if callable(touch):
                 touch()
@@ -750,7 +877,8 @@ class WhisperEngine:
         language: str | None,
         without_timestamps: bool,
     ) -> TranscriptionResult:
-        self.models.touch()
+        if self.models is not None:
+            self.models.touch()
         try:
             audio = _decode_audio(data)
         except Exception as exc:
@@ -771,6 +899,7 @@ class WhisperEngine:
                 lang_confidence=self.config.lang_confidence,
                 speech=self.speech,
                 without_timestamps=without_timestamps,
+                non_english=self.config.non_english,
             )
         except DecodeError:
             raise

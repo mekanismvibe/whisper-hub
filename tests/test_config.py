@@ -59,3 +59,11 @@ def test_dotenv_parsing(tmp_path):
     assert values["WHUB_MODEL"] == "base"
     assert values["WHUB_PUBLIC_URL"] == "http://hub.lan:8765/"
     assert values["WHUB_MAX_UPLOAD_MB"] == "7"
+
+
+def test_non_english_env_parsing():
+    assert Config().non_english is False
+    assert Config.from_env({"WHUB_NON_ENGLISH": "yes"}).non_english is True
+    assert Config.from_env({"WHUB_NON_ENGLISH": "off"}).non_english is False
+    with pytest.raises(ValueError):
+        Config.from_env({"WHUB_NON_ENGLISH": "sometimes"})

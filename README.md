@@ -15,8 +15,9 @@ cloud, no audio files.
 
 - OpenAI-compatible `POST /v1/audio/transcriptions` and
   `POST /v1/audio/translations`, plus `GET /v1/models`.
-- Detects the spoken language. English is transcribed; every other language is
-  translated to English.
+- English-only by default: no language detection, no translation and no extra
+  models. Non-English speech (detect and translate to English) is an opt-in
+  toggle.
 - Per-device API keys, QR-code pairing, revoke/re-pair without touching other
   devices.
 - Shared history with full-text search, device filters and per-entry detail.
@@ -38,6 +39,18 @@ cloud, no audio files.
 <td><img src="docs/screenshots/devices-desktop.png" alt="Paired devices"></td>
 </tr>
 </table>
+
+## English-only by default
+
+The hub assumes English dictation. Language detection and translation are off,
+so no translation model is downloaded or loaded and Parakeet users need no
+Whisper model at all. Turning on **Non-English speech** in Settings (or the
+first-run wizard) enables the previous hybrid behaviour: Whisper detects the
+language and non-English clips are translated to English.
+
+Measured with the `small` Whisper model and Parakeet on a CUDA GPU, enabling it
+costs about 290 MB extra VRAM, 170 MB extra RAM and 0.5 s extra startup, and an
+English clip takes about 80 ms longer (135 ms vs 56 ms).
 
 ## Quick start
 
@@ -117,7 +130,8 @@ The same one-time token is written to `data/setup_token`. The wizard then:
 1. Sets the dashboard password (scrypt-hashed, at least 8 characters).
 2. Shows detected hardware: CUDA GPU and VRAM (when available), CPU cores and
    RAM, and recommends a model.
-3. Lets you pick the main model, translation model and English engine.
+3. Lets you pick the main model, English engine and (optionally) non-English
+   speech detection with a translation model.
 4. Asks for the public URL (prefilled from the request) and an optional HTTPS
    URL used behind a reverse proxy.
 5. Signs you in and starts the model download/load in the background.
@@ -189,9 +203,9 @@ Use the wizard's recommendation as a starting point:
 | Smaller CUDA GPU | `small` |
 | CPU only | `base`, or `small` with 8+ cores and enough RAM |
 
-`large-v3-turbo` and the distil models are fast but **cannot translate**.
-Choose a full model (for example `large-v3`) as the translation model if you use
-one of them.
+`large-v3-turbo` and the distil models are fast but **cannot translate**. With
+non-English speech enabled, choose a full model (for example `large-v3`) as the
+translation model if you use one of them. English-only mode can use them alone.
 
 Installed models appear in Settings with live status: downloading, loading,
 ready or error. A failed load keeps the previous engine running.
@@ -227,6 +241,7 @@ port and data directory are environment/CLI only.
 | `WHUB_TRANSLATE_MODEL` | main model | Model used for non-English audio |
 | `WHUB_ENGLISH_ENGINE` | `whisper` | `whisper` or `parakeet` |
 | `WHUB_PARAKEET_MODEL` | `moondream/parakeet-ultra` | Parakeet model id |
+| `WHUB_NON_ENGLISH` | `false` | Enable language detection and translation |
 | `WHUB_DEVICE` | `auto` | `auto`, `cpu` or `cuda` |
 | `WHUB_COMPUTE_TYPE` | `auto` | e.g. `int8`, `int8_float16`, `float16` |
 | `WHUB_CPU_THREADS` | `0` | 0 = library default |
@@ -257,8 +272,8 @@ port and data directory are environment/CLI only.
 CUDA wheels Whisper needs. For Docker, build with `--build-arg EXTRAS=parakeet`.
 When the English engine is set to `parakeet`:
 
-- English audio is transcribed by Parakeet Ultra; other languages still use
-  Whisper.
+- English audio is transcribed by Parakeet Ultra. With non-English speech
+  enabled, other languages are still handled by Whisper.
 - The runtime is **proprietary software** under the M87 Labs licence, not an
   open-source component of this project.
 - It sends **usage telemetry** (hostname, GPU information, request counts) to

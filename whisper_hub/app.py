@@ -465,9 +465,14 @@ def _setup_url(config: Config, token: str) -> str:
 
 
 def _expected_model_bytes(config: Config) -> int:
-    names = {config.model, config.translate_model_name}
+    # Only count the models this configuration actually loads.
+    names: set[str] = set()
     if config.english_engine == "parakeet":
         names.add(config.parakeet_model)
+    if config.non_english or config.english_engine == "whisper":
+        names.add(config.model)
+    if config.non_english:
+        names.add(config.translate_model_name)
     total = 0
     for name in names:
         info = catalog.model_info(name)
@@ -550,11 +555,14 @@ def create_app(
     engine_factory = engine_factory or WhisperEngine
     engine = engine or engine_factory(config)
     try:
-        catalog.validate_models(config.model, config.translate_model)
+        if config.non_english:
+            catalog.validate_models(config.model, config.translate_model)
+        elif not config.model.strip():
+            raise ValueError("Choose a main model.")
     except ValueError as exc:
         # Env-pinned models skip the UI's validation; make the misconfiguration loud.
         logger.error("model configuration problem: %s", exc)
-    if config.uses_turbo_without_translator:
+    if config.non_english and config.uses_turbo_without_translator:
         logger.warning(
             "WHUB_MODEL=%s cannot translate. Set WHUB_TRANSLATE_MODEL "
             "(for example large-v3) or non-English audio will fail.",
@@ -595,12 +603,13 @@ def create_app(
         idle_task = asyncio.create_task(idle_loop())
         logger.info(
             "whisper-hub %s ready: model=%s translate_model=%s english_engine=%s "
-            "parakeet_model=%s device=%s data=%s",
+            "parakeet_model=%s non_english=%s device=%s data=%s",
             __version__,
             config.model,
             config.translate_model_name,
             config.english_engine,
             config.parakeet_model if config.english_engine == "parakeet" else None,
+            config.non_english,
             getattr(app.state.engine, "device", config.device),
             data_dir,
         )
@@ -731,6 +740,7 @@ def create_app(
     async def healthz(request: Request) -> dict[str, Any]:
         current = request.app.state.config
         active = request.app.state.engine
+        loaded = bool(active.models_loaded)
         return {
             "ok": True,
             "model": current.model,
@@ -739,9 +749,13 @@ def create_app(
             "parakeet_model": (
                 current.parakeet_model if current.english_engine == "parakeet" else None
             ),
+            "non_english": current.non_english,
             "device": getattr(active, "device", current.device),
-            "models_loaded": bool(active.models_loaded),
+            "models_loaded": loaded,
+            "ready": loaded,
+            "whisper_loaded": bool(getattr(active, "whisper_loaded", False)),
             "parakeet_loaded": bool(getattr(active, "parakeet_loaded", False)),
+            "loaded_models": list(getattr(active, "loaded_models", []) or []),
             "model_status": request.app.state.manager.status()["state"],
         }
 
@@ -964,6 +978,7 @@ def create_app(
             "model": payload.get("model"),
             "translate_model": payload.get("translate_model") or "",
             "english_engine": english_engine,
+            "non_english": payload.get("non_english", False),
             "public_url": payload.get("public_url") or "",
             "https_url": payload.get("https_url") or "",
         }
@@ -1174,10 +1189,13 @@ def create_app(
             "parakeet_model": (
                 current.parakeet_model if current.english_engine == "parakeet" else None
             ),
+            "non_english": current.non_english,
             "device": getattr(active, "device", current.device),
             "compute_type": getattr(active, "compute_type", None),
             "models_loaded": bool(active.models_loaded),
+            "whisper_loaded": bool(getattr(active, "whisper_loaded", False)),
             "parakeet_loaded": bool(getattr(active, "parakeet_loaded", False)),
+            "loaded_models": list(getattr(active, "loaded_models", []) or []),
             "model_status": model_status,
             "version": __version__,
         }
@@ -1286,6 +1304,7 @@ def create_app(
             new_config.compute_type,
             new_config.cpu_threads,
             new_config.parakeet_model,
+            new_config.non_english,
         ) != (
             old.model,
             old.translate_model_name,
@@ -1294,6 +1313,7 @@ def create_app(
             old.compute_type,
             old.cpu_threads,
             old.parakeet_model,
+            old.non_english,
         )
         reload_requested = False
         if engine_changed:
@@ -1424,6 +1444,10 @@ def create_app(
         status = request.app.state.manager.status()
         status["model"] = request.app.state.config.model
         status["translate_model"] = request.app.state.config.translate_model_name
+        status["non_english"] = request.app.state.config.non_english
+        status["loaded_models"] = list(
+            getattr(request.app.state.engine, "loaded_models", []) or []
+        )
         return status
 
     @admin.get("/setup")

@@ -82,7 +82,9 @@ def test_settings_api_rejects_out_of_range_translate_beam_size(admin: TestClient
 
 
 def test_settings_api_rejects_a_translation_capable_main_without_translator(client_factory):
-    client, _, _ = client_factory(engine_factory=lambda config: FakeEngine())
+    client, _, _ = client_factory(
+        non_english=True, engine_factory=lambda config: FakeEngine()
+    )
     client.post("/api/login", json={"password": ADMIN_PASSWORD})
     response = client.post(
         "/api/admin/settings", json={"model": "large-v3-turbo", "translate_model": ""}
@@ -240,3 +242,57 @@ def test_env_locked_setting_is_read_only_over_the_api(tmp_path):
         assert client.post("/api/admin/settings", json={"beam_size": 2}).status_code == 200
     finally:
         client.__exit__(None, None, None)
+
+
+def test_non_english_defaults_off_and_allows_an_untranslatable_main(client_factory):
+    client, _, _ = client_factory(engine_factory=lambda config: FakeEngine())
+    assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+    body = client.get("/api/admin/settings").json()
+    assert body["values"]["non_english"] is False
+    assert body["defaults"]["non_english"] is False
+
+    response = client.post(
+        "/api/admin/settings", json={"model": "large-v3-turbo", "translate_model": ""}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["reload_requested"] is True
+    assert client.app.state.manager.wait(5)
+    assert client.app.state.config.model == "large-v3-turbo"
+
+
+def test_toggling_non_english_triggers_a_reload(client_factory):
+    def factory(config: Config) -> FakeEngine:
+        engine = FakeEngine()
+        engine.config = config
+        return engine
+
+    client, _, _ = client_factory(engine_factory=factory)
+    assert client.post("/api/login", json={"password": ADMIN_PASSWORD}).status_code == 200
+
+    response = client.post("/api/admin/settings", json={"non_english": True})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["reload_requested"] is True
+    assert response.json()["values"]["non_english"] is True
+    assert client.app.state.config.non_english is True
+    assert client.app.state.manager.wait(5)
+    assert client.app.state.engine.config.non_english is True
+
+
+def test_env_locks_non_english(tmp_path):
+    config = Config.from_env(
+        {
+            "WHUB_NON_ENGLISH": "true",
+            "WHUB_ADMIN_PASSWORD": ADMIN_PASSWORD,
+            "WHUB_DATA_DIR": str(tmp_path / "data"),
+        }
+    )
+    store = _store(tmp_path, config)
+
+    assert config.non_english is True
+    assert store.locked["non_english"] == "WHUB_NON_ENGLISH"
+    assert store.snapshot()["non_english"] is True
+    with pytest.raises(EnvLockedError):
+        store.update({"non_english": False})
+    # Sending the pinned value back is harmless.
+    store.update({"non_english": True})

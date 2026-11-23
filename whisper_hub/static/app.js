@@ -1949,6 +1949,11 @@
 
   /* ---------------------------------------------------------------- setup wizard */
 
+  // Measured on the reference GPU at 16 kHz: small + Parakeet, English-only vs hybrid.
+  const NON_ENGLISH_NOTE =
+    "Measured with small + Parakeet: about 290 MB extra VRAM, 170 MB extra RAM and 0.5 s extra startup. " +
+    "An English clip takes about 80 ms longer (135 ms vs 56 ms).";
+
   const WIZARD_STEPS = ["Password", "Hardware", "Models", "Address", "Finish"];
 
   function showWizard(token, tokenValid) {
@@ -1965,6 +1970,8 @@
       model: "base",
       translateModel: "",
       engine: "whisper",
+      nonEnglish: false,
+      locked: {},
       publicUrl: location.origin,
       httpsUrl: "",
     };
@@ -2093,9 +2100,11 @@
         wizard.catalog = payload.catalog;
         // Env-pinned values win over the hardware recommendation (the server ignores them anyway).
         const pinned = payload.values || {};
+        wizard.locked = payload.locked || {};
         wizard.model = pinned.model || payload.hardware.recommended_model;
         wizard.translateModel = "translate_model" in pinned ? pinned.translate_model || "" : payload.hardware.recommended_translate_model;
         if (pinned.english_engine) wizard.engine = pinned.english_engine;
+        if ("non_english" in pinned) wizard.nonEnglish = Boolean(pinned.non_english);
         if (pinned.public_url) wizard.publicUrl = pinned.public_url;
         if (pinned.https_url) wizard.httpsUrl = pinned.https_url;
       } catch (error) {
@@ -2156,12 +2165,20 @@
     const wizard = state.wizard;
     const hardware = wizard.hardware;
     const catalog = wizard.catalog || [];
+    const mainModels = wizard.nonEnglish
+      ? catalog
+      : [...catalog].sort((a, b) => Number(b.id.endsWith(".en")) - Number(a.id.endsWith(".en")));
     const mainSelect = h(
       "select",
       { id: "wizard-model" },
-      ...catalog.map((model) => new Option(`${model.label} · about ${model.download_mb} MB download`, model.id, false, model.id === wizard.model))
+      ...mainModels.map((model) => new Option(`${model.label} · about ${model.download_mb} MB download`, model.id, false, model.id === wizard.model))
     );
     const translationSelect = h("select", { id: "wizard-translate-model" });
+    const nonEnglish = h("input", {
+      id: "wizard-non-english",
+      type: "checkbox",
+      checked: wizard.nonEnglish ? true : null,
+    });
     const engineSelect = h(
       "select",
       { id: "wizard-engine" },
@@ -2188,6 +2205,30 @@
         ? "Optional. Keep “Same as the main model” unless you want a stronger translator."
         : "Required: the main model cannot translate non-English audio.";
     }
+    const translateField = h(
+      "div",
+      { class: "field" },
+      h("label", { for: "wizard-translate-model", text: "Translation model" }),
+      translationSelect,
+      translationNote
+    );
+    const nonEnglishField = h(
+      "div",
+      { class: "field" },
+      h("label", { for: "wizard-non-english", text: "Non-English speech (detect language and translate to English)" }),
+      nonEnglish,
+      h("p", { class: "field-note", text: NON_ENGLISH_NOTE }),
+      "non_english" in wizard.locked
+        ? h("p", { class: "field-note env-lock", text: `set by ${wizard.locked.non_english}` })
+        : null
+    );
+    if ("non_english" in wizard.locked) nonEnglish.disabled = true;
+
+    function syncEnglishOnly() {
+      wizard.nonEnglish = nonEnglish.checked;
+      translateField.hidden = !nonEnglish.checked;
+      if (nonEnglish.checked) syncModels();
+    }
     mainSelect.addEventListener("change", () => {
       wizard.model = mainSelect.value;
       syncModels();
@@ -2195,11 +2236,13 @@
     translationSelect.addEventListener("change", () => {
       wizard.translateModel = translationSelect.value;
     });
+    nonEnglish.addEventListener("change", syncEnglishOnly);
     engineSelect.addEventListener("change", () => {
       wizard.engine = engineSelect.value;
       parakeetNote.hidden = wizard.engine !== "parakeet";
     });
     syncModels();
+    syncEnglishOnly();
 
     if (!hardware.moondream) {
       parakeetNote.hidden = true;
@@ -2213,9 +2256,10 @@
         "div",
         { class: "wizard-block" },
         h("h2", { text: "Pick the models" }),
-        h("p", { class: "muted", text: "You can change all of this later in Settings. The main model handles detection and English; the translation model handles other languages." }),
+        h("p", { class: "muted", text: "You can change all of this later in Settings. English-only speech is the default; enabling non-English speech adds language detection and translation." }),
         h("div", { class: "field" }, h("label", { for: "wizard-model", text: "Main model" }), mainSelect, modelNote),
-        h("div", { class: "field" }, h("label", { for: "wizard-translate-model", text: "Translation model" }), translationSelect, translationNote),
+        nonEnglishField,
+        translateField,
         h("div", { class: "field" }, h("label", { for: "wizard-engine", text: "English engine" }), engineSelect, parakeetNote),
         wizardNav([
           wizardButton("Back", () => {
@@ -2299,6 +2343,7 @@
             model: wizard.model,
             translate_model: wizard.translateModel,
             english_engine: wizard.engine,
+            non_english: wizard.nonEnglish,
             public_url: wizard.publicUrl,
             https_url: wizard.httpsUrl,
           },
@@ -2320,7 +2365,8 @@
           "dl",
           { class: "detail-meta wizard-meta" },
           h("div", {}, h("dt", { text: "Main model" }), h("dd", { text: main ? main.label : wizard.model })),
-          h("div", {}, h("dt", { text: "Translation model" }), h("dd", { text: translate ? translate.label : wizard.translateModel || "Same as main" })),
+          h("div", {}, h("dt", { text: "Non-English speech" }), h("dd", { text: wizard.nonEnglish ? "Enabled" : "Off (English-only)" })),
+          h("div", {}, h("dt", { text: "Translation model" }), h("dd", { text: wizard.nonEnglish ? (translate ? translate.label : wizard.translateModel || "Same as main") : "Not used" })),
           h("div", {}, h("dt", { text: "English engine" }), h("dd", { text: wizard.engine === "parakeet" ? "Parakeet Ultra" : "Whisper" })),
           h("div", {}, h("dt", { text: "Public URL" }), h("dd", { text: wizard.publicUrl })),
           h("div", {}, h("dt", { text: "HTTPS URL" }), h("dd", { text: wizard.httpsUrl || "Not set" }))
@@ -2343,7 +2389,8 @@
     {
       title: "Models",
       fields: [
-        { name: "model", label: "Main model", type: "model", note: "Used for detection and English transcription." },
+        { name: "model", label: "Main model", type: "model", note: "Used for English transcription. English-only .en models are listed first while non-English speech is off." },
+        { name: "non_english", label: "Non-English speech (detect language and translate to English)", type: "checkbox", note: NON_ENGLISH_NOTE },
         { name: "translate_model", label: "Translation model", type: "translate", note: "Used for non-English audio. Must be able to translate." },
         { name: "english_engine", label: "English engine", type: "select", options: ["whisper", "parakeet"], note: "Parakeet is optional and needs the parakeet extra." },
       ],
@@ -2397,7 +2444,12 @@
         let input;
         if (field.type === "model") {
           input = h("select", { id });
-          const options = catalog.map((model) => new Option(`${model.label} (${model.download_mb} MB)`, model.id));
+          // English-only checkpoints are the better default when nothing is translated;
+          // multilingual models stay selectable.
+          const models = values.non_english
+            ? catalog
+            : [...catalog].sort((a, b) => Number(b.id.endsWith(".en")) - Number(a.id.endsWith(".en")));
+          const options = models.map((model) => new Option(`${model.label} (${model.download_mb} MB)`, model.id));
           if (!catalog.some((model) => model.id === values[field.name])) options.unshift(new Option(String(values[field.name]), values[field.name]));
           input.append(...options);
           input.value = values[field.name];
@@ -2438,7 +2490,7 @@
           isLocked ? h("p", { class: "field-note env-lock", id: `${id}-locked`, text: `set by ${locked[field.name]}` }) : null
         );
         fields.append(wrap);
-        refs.set(field.name, { input, type: field.type, field });
+        refs.set(field.name, { input, type: field.type, field, wrap });
       }
       const panel = h(
         "section",
@@ -2483,6 +2535,23 @@
       event.target.dataset.chosen = event.target.value;
     });
     syncTranslation();
+
+    const nonEnglishOnlyFields = [
+      "translate_model",
+      "translate_beam_size",
+      "lang_confidence",
+      "honor_client_language",
+    ];
+    function syncNonEnglish() {
+      const enabled = refs.get("non_english").input.checked;
+      for (const name of nonEnglishOnlyFields) {
+        const ref = refs.get(name);
+        if (ref) ref.wrap.hidden = !enabled;
+      }
+      if (enabled) syncTranslation();
+    }
+    refs.get("non_english").input.addEventListener("change", syncNonEnglish);
+    syncNonEnglish();
 
     replace($("#settings-fields"), ...containers);
     $("#settings-save-note").textContent = "";
@@ -2574,9 +2643,10 @@
       replace(
         $("#status-meta"),
         h("div", {}, h("dt", { text: "Main model" }), h("dd", { text: status.model || "—" })),
-        h("div", {}, h("dt", { text: "Translation" }), h("dd", { text: status.translate_model || status.model || "—" })),
+        h("div", {}, h("dt", { text: "Translation" }), h("dd", { text: status.non_english === false ? "Off (English-only)" : status.translate_model || status.model || "—" })),
         h("div", {}, h("dt", { text: "Device" }), h("dd", { text: status.device || "—" })),
-        h("div", {}, h("dt", { text: "Compute" }), h("dd", { text: status.compute_type || "—" }))
+        h("div", {}, h("dt", { text: "Compute" }), h("dd", { text: status.compute_type || "—" })),
+        h("div", {}, h("dt", { text: "Loaded" }), h("dd", { text: (status.loaded_models || []).join(", ") || "None" }))
       );
     }
   }

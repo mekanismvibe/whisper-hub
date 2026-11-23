@@ -27,6 +27,7 @@ SETTING_NAMES: tuple[str, ...] = (
     "max_concurrency",
     "model_idle_unload_seconds",
     "max_upload_mb",
+    "non_english",
     "lang_confidence",
     "honor_client_language",
     "public_url",
@@ -43,6 +44,7 @@ ENGINE_RELOAD_FIELDS = frozenset(
         "compute_type",
         "cpu_threads",
         "parakeet_model",
+        "non_english",
     }
 )
 
@@ -66,7 +68,7 @@ def env_name(field: str) -> str:
 
 def parse_value(field: str, raw: Any) -> Any:
     """Coerce a DB string or JSON value to the field's Python type."""
-    if field == "honor_client_language":
+    if field in {"honor_client_language", "non_english"}:
         if isinstance(raw, bool):
             return raw
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
@@ -145,7 +147,10 @@ def validate_values(values: dict[str, Any], *, check_models: bool = True) -> dic
         raise SettingsError("Parakeet model id cannot be empty.")
     if check_models:
         try:
-            catalog.validate_models(cleaned["model"], cleaned["translate_model"])
+            if cleaned.get("non_english"):
+                catalog.validate_models(cleaned["model"], cleaned["translate_model"])
+            elif not cleaned["model"]:
+                raise ValueError("Choose a main model.")
         except ValueError as exc:
             raise SettingsError(str(exc)) from None
         if cleaned["device"] == "auto" and "float16" in cleaned["compute_type"]:
