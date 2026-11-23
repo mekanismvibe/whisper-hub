@@ -558,36 +558,70 @@
     return state.devices;
   }
 
+  // Every Recent fetch takes a ticket; only the newest one for the current filter may paint.
+  let recentSeq = 0;
+  const renderKeys = { recent: "", cards: "" };
+
+  function recentQuery() {
+    const query = new URLSearchParams({ limit: "20" });
+    if (state.recentFilter !== "all") query.set("device_id", state.recentFilter);
+    return query;
+  }
+
+  function recentFilterIsStale() {
+    // The filtered device was deleted: fall back to "All" instead of an empty list.
+    if (state.recentFilter === "all") return false;
+    if (state.devices.some((device) => String(device.id) === String(state.recentFilter))) return false;
+    state.recentFilter = "all";
+    return true;
+  }
+
+  function paintOverview({ force = false } = {}) {
+    renderStats();
+    renderFirstDeviceCta();
+    const cardsKey = JSON.stringify(state.devices);
+    if (force || cardsKey !== renderKeys.cards) {
+      renderKeys.cards = cardsKey;
+      renderDeviceCards($("#device-grid"), "overview");
+      renderRecentChips();
+    }
+    const recentKey = state.recentFilter + JSON.stringify(state.recent.map((item) => [item.id, item.text]));
+    // Unchanged lists are left alone so the 10 s refresh does not steal focus or selection.
+    if (force || recentKey !== renderKeys.recent) {
+      renderKeys.recent = recentKey;
+      renderRecent();
+    }
+  }
+
   async function loadOverview() {
+    const seq = ++recentSeq;
+    const filter = state.recentFilter;
     try {
-      const recentQuery = new URLSearchParams({ limit: "20" });
-      if (state.recentFilter !== "all") recentQuery.set("device_id", state.recentFilter);
       const [stats, devices, recent] = await Promise.all([
         api("/api/admin/stats"),
         api("/api/admin/devices"),
-        api(`/api/admin/transcriptions?${recentQuery}`),
+        api(`/api/admin/transcriptions?${recentQuery()}`),
       ]);
       state.stats = stats;
       state.devices = devices.devices;
-      state.recent = recent.items;
       syncDeviceSelect();
-      renderStats();
-      renderDeviceCards($("#device-grid"), "overview");
-      renderFirstDeviceCta();
-      renderRecentChips();
-      renderRecent();
+      if (recentFilterIsStale()) return loadOverview();
+      if (seq === recentSeq && filter === state.recentFilter) state.recent = recent.items;
+      paintOverview({ force: true });
     } catch (error) {
       if (error.status !== 401) toast(error.message, "error");
     }
   }
 
   async function loadRecent() {
+    const seq = ++recentSeq;
+    const filter = state.recentFilter;
     try {
-      const query = new URLSearchParams({ limit: "20" });
-      if (state.recentFilter !== "all") query.set("device_id", state.recentFilter);
-      const recent = await api(`/api/admin/transcriptions?${query}`);
+      const recent = await api(`/api/admin/transcriptions?${recentQuery()}`);
+      if (seq !== recentSeq || filter !== state.recentFilter) return;
       state.recent = recent.items;
-      renderRecent();
+      renderKeys.recent = "";
+      paintOverview();
     } catch (error) {
       toast(error.message, "error");
     }
@@ -595,24 +629,22 @@
 
   async function refreshLive() {
     if (!state.authenticated) return;
+    const seq = ++recentSeq;
+    const filter = state.recentFilter;
     try {
-      const query = new URLSearchParams({ limit: "20" });
-      if (state.recentFilter !== "all") query.set("device_id", state.recentFilter);
       const [stats, devices, recent] = await Promise.all([
         api("/api/admin/stats"),
         api("/api/admin/devices"),
-        api(`/api/admin/transcriptions?${query}`),
+        api(`/api/admin/transcriptions?${recentQuery()}`),
       ]);
       state.stats = stats;
       state.devices = devices.devices;
       syncDeviceSelect();
+      const staleFilter = recentFilterIsStale();
       if (state.view === "overview") {
-        state.recent = recent.items;
-        renderStats();
-        renderDeviceCards($("#device-grid"), "overview");
-        renderFirstDeviceCta();
-        renderRecentChips();
-        renderRecent();
+        if (staleFilter) return loadOverview();
+        if (seq === recentSeq && filter === state.recentFilter) state.recent = recent.items;
+        paintOverview();
       }
       if (state.view === "devices") renderDeviceCards($("#devices-grid"), "devices");
       if (state.view === "settings") renderModelStatusFromStats();
@@ -936,6 +968,7 @@
       openEntry(item.id);
     });
     row.addEventListener("keydown", (event) => {
+      if (event.target.closest("button, a")) return;
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
         openEntry(item.id);
@@ -988,8 +1021,10 @@
     select.replaceChildren(...options);
     select.value = current;
     if (select.value !== current) {
+      // The filtered device is gone: show all devices, and reload so the list matches.
       select.value = "";
       state.history.deviceId = "";
+      if (state.view === "history") loadHistory(true);
     }
   }
 
@@ -1088,7 +1123,10 @@
 
   /* ---------------------------------------------------------------- entry detail */
 
+  let entrySeq = 0;
+
   async function openEntry(id) {
+    const seq = ++entrySeq;
     const overlay = $("#entry-overlay");
     overlay.hidden = false;
     lockScroll();
@@ -1097,10 +1135,11 @@
     setTimeout(() => $(".drawer-head .icon-btn").focus({ preventScroll: true }), 30);
     try {
       const item = await api(`/api/admin/transcriptions/${id}`);
-      if (overlay.hidden) return;
+      // A later open (or close + reopen) supersedes this response.
+      if (overlay.hidden || seq !== entrySeq) return;
       renderEntry(item);
     } catch (error) {
-      if (overlay.hidden) return;
+      if (overlay.hidden || seq !== entrySeq) return;
       replace($("#entry-body"), emptyState({ iconName: "alert", title: "Could not load this entry", message: error.message }));
     }
   }
@@ -1477,7 +1516,7 @@
   }
 
   function openRecordModal() {
-    if (window.MediaRecorder === undefined && !navigator.mediaDevices) {
+    if (window.isSecureContext && !recordSupported()) {
       toast("This browser cannot record audio.", "error");
     }
     const record = {
@@ -1713,7 +1752,8 @@
     const { button, timer, levels, hint, result, fileRow } = record.refs;
     if (!button) return;
     button.classList.toggle("recording", record.status === "recording");
-    button.disabled = record.status === "sending" || record.status === "starting";
+    const supported = recordSupported();
+    button.disabled = !supported || record.status === "sending" || record.status === "starting";
     button.replaceChildren(icon(record.status === "recording" ? "stop" : "mic"));
     button.setAttribute("aria-label", record.status === "recording" ? "Stop recording" : "Start recording");
     levels.style.visibility = record.status === "recording" ? "visible" : "hidden";
@@ -1724,7 +1764,7 @@
     else if (record.status === "sending") hint.textContent = "Transcribing…";
     else if (record.status === "done") hint.textContent = "Done. Record again or upload a file.";
     else if (record.status === "error") hint.textContent = "Something went wrong. Try again.";
-    else hint.textContent = "Tap the microphone, speak, then tap again to stop.";
+    else hint.textContent = supported ? "Tap the microphone, speak, then tap again to stop." : "Upload a recording to transcribe it.";
 
     replace(result);
     if (record.status === "sending") {
@@ -1960,8 +2000,13 @@
         const payload = await api(`/api/setup/hardware?token=${encodeURIComponent(wizard.token)}`);
         wizard.hardware = payload.hardware;
         wizard.catalog = payload.catalog;
-        wizard.model = payload.hardware.recommended_model;
-        wizard.translateModel = payload.hardware.recommended_translate_model;
+        // Env-pinned values win over the hardware recommendation (the server ignores them anyway).
+        const pinned = payload.values || {};
+        wizard.model = pinned.model || payload.hardware.recommended_model;
+        wizard.translateModel = "translate_model" in pinned ? pinned.translate_model || "" : payload.hardware.recommended_translate_model;
+        if (pinned.english_engine) wizard.engine = pinned.english_engine;
+        if (pinned.public_url) wizard.publicUrl = pinned.public_url;
+        if (pinned.https_url) wizard.httpsUrl = pinned.https_url;
       } catch (error) {
         replace(
           body,
@@ -2376,8 +2421,10 @@
       if (input.disabled) return;
       const field = input.dataset.setting;
       if (input.type === "checkbox") payload[field] = input.checked;
-      else if (["beam_size", "cpu_threads", "max_concurrency", "max_upload_mb"].includes(field)) payload[field] = Number(input.value);
-      else if (["model_idle_unload_seconds", "lang_confidence"].includes(field)) payload[field] = Number(input.value);
+      else if (["beam_size", "cpu_threads", "max_concurrency", "max_upload_mb", "model_idle_unload_seconds", "lang_confidence"].includes(field)) {
+        // An emptied number box means "leave unchanged", not 0 (0 disables some features).
+        if (input.value.trim() !== "") payload[field] = Number(input.value);
+      }
       else payload[field] = input.value.trim();
     });
     button.disabled = true;

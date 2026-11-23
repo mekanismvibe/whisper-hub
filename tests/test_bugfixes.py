@@ -65,3 +65,34 @@ def test_delete_all_history_leaves_no_text_in_db_file(admin: TestClient, fake):
     assert admin.delete("/api/admin/history?confirm=DELETE").status_code == 200
     db_path = admin.app.state.db.path
     assert b"zebraquux" not in db_path.read_bytes()
+
+
+def test_settings_save_returns_the_full_payload(admin: TestClient):
+    current = admin.get("/api/admin/settings").json()
+    saved = admin.post("/api/admin/settings", json={"beam_size": 3}).json()
+    assert saved["values"]["beam_size"] == 3
+    for key in ("server", "parakeet_available", "model_status", "locked"):
+        assert key in saved and key in current
+
+
+def test_setup_finishes_when_model_is_pinned_by_env(tmp_path):
+    from whisper_hub.app import create_app
+    from whisper_hub.config import Config
+
+    from .conftest import FakeEngine
+
+    config = Config(
+        data_dir=tmp_path / "data", admin_password=None, model="tiny", preload=False,
+        env_names=frozenset({"WHUB_MODEL"}),
+    )
+    app = create_app(config, engine=FakeEngine(), engine_factory=lambda cfg: FakeEngine())
+    with TestClient(app) as client:
+        token = app.state.setup_token
+        hw = client.get("/api/setup/hardware", params={"token": token}).json()
+        assert hw["locked"] == {"model": "WHUB_MODEL"} and hw["values"]["model"] == "tiny"
+        assert client.post(
+            "/api/setup/password", json={"token": token, "password": "long-enough", "confirm": "long-enough"}
+        ).status_code == 200
+        done = client.post("/api/setup/finish", json={"token": token, "model": "medium", "english_engine": "whisper"})
+        assert done.status_code == 200, done.text
+        assert app.state.config.model == "tiny"

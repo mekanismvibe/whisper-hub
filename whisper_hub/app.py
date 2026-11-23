@@ -782,7 +782,14 @@ def create_app(
     async def setup_hardware(request: Request, token: str | None = None) -> dict[str, Any]:
         require_setup_token(request, token)
         detected = hardware.detect_hardware()
-        return {"hardware": detected, "catalog": catalog.catalog_payload()}
+        store: SettingsStore = request.app.state.settings
+        return {
+            "hardware": detected,
+            "catalog": catalog.catalog_payload(),
+            # Fields pinned by WHUB_* env vars: the wizard shows them read-only.
+            "locked": dict(store.locked),
+            "values": {field: store.snapshot().get(field) for field in store.locked},
+        }
 
     @app.post("/api/setup/finish")
     async def setup_finish(request: Request) -> dict[str, Any]:
@@ -805,6 +812,10 @@ def create_app(
             "public_url": payload.get("public_url") or "",
             "https_url": payload.get("https_url") or "",
         }
+        # Env vars win over the wizard (env > DB > default), so pinned fields are skipped
+        # rather than making setup impossible to finish.
+        for field in request.app.state.settings.locked:
+            selection.pop(field, None)
         try:
             new_config = request.app.state.settings.update(selection)
         except EnvLockedError as exc:
@@ -1038,8 +1049,7 @@ def create_app(
             "model": result.model or request.app.state.config.model,
         }
 
-    @admin.get("/settings")
-    async def admin_get_settings(request: Request) -> dict[str, Any]:
+    def _settings_payload(request: Request) -> dict[str, Any]:
         store: SettingsStore = request.app.state.settings
         current = request.app.state.config
         payload = store.payload()
@@ -1053,6 +1063,10 @@ def create_app(
             "preload": current.preload,
         }
         return payload
+
+    @admin.get("/settings")
+    async def admin_get_settings(request: Request) -> dict[str, Any]:
+        return _settings_payload(request)
 
     @admin.post("/settings")
     async def admin_update_settings(request: Request) -> dict[str, Any]:
@@ -1112,12 +1126,8 @@ def create_app(
             reload_requested = _start_engine_swap(
                 request.app, new_config, set(ENGINE_RELOAD_FIELDS)
             )
-        return {
-            "ok": True,
-            "reload_requested": reload_requested,
-            **store.payload(),
-            "model_status": manager.status(),
-        }
+        # Same shape as GET so the dashboard can re-render from the response directly.
+        return {"ok": True, "reload_requested": reload_requested, **_settings_payload(request)}
 
     @admin.post("/password")
     async def admin_change_password(request: Request) -> dict[str, Any]:
