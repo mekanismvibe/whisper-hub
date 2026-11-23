@@ -38,12 +38,12 @@ def _dir_size(path: Path) -> int:
 
 
 def default_cache_dir() -> Path:
-    import os
+    try:
+        from huggingface_hub import constants
 
-    root = os.environ.get("HF_HOME")
-    if root:
-        return Path(root).expanduser() / "hub"
-    return Path.home() / ".cache" / "huggingface" / "hub"
+        return Path(constants.HF_HUB_CACHE)  # honors HF_HUB_CACHE, HF_HOME and XDG_CACHE_HOME
+    except Exception:  # pragma: no cover - huggingface_hub ships with faster-whisper
+        return Path.home() / ".cache" / "huggingface" / "hub"
 
 
 class EngineManager:
@@ -79,7 +79,15 @@ class EngineManager:
         with self._lock:
             status = dict(self._status)
         status["busy"] = self.busy
-        status["models_loaded"] = bool(self._engine.models_loaded)
+        loaded = bool(self._engine.models_loaded)
+        status["models_loaded"] = loaded
+        # Lazy loads and idle unloads happen outside the manager; reflect them here.
+        if not status["busy"]:
+            if loaded and status["state"] in (IDLE, ERROR) and not status.get("swap_failed"):
+                status["state"], status["message"] = READY, ""
+            elif not loaded and status["state"] == READY:
+                status["state"] = IDLE
+        status.pop("swap_failed", None)
         status["device"] = getattr(self._engine, "device", None)
         status["compute_type"] = getattr(self._engine, "compute_type", None)
         return status
@@ -153,6 +161,8 @@ class EngineManager:
                     "model": self._status.get("model", ""),
                     "progress": None,
                     "updated_at": time.time(),
+                    # The old engine still serves, but the UI must keep showing the failure.
+                    "swap_failed": True,
                 }
         else:
             with self._lock:
@@ -183,8 +193,10 @@ class EngineManager:
                 monitor.join(timeout=1)
 
     def _monitor(self, expected_bytes: int, stop: threading.Event) -> None:
+        # Measure growth since the download started, not the whole (shared) HF cache.
+        baseline = _dir_size(self._cache_dir)
         while not stop.wait(2.0):
-            size = _dir_size(self._cache_dir)
+            size = max(0, _dir_size(self._cache_dir) - baseline)
             progress = min(99, int(size / expected_bytes * 100)) if expected_bytes else None
             with self._lock:
                 if self._status.get("state") not in {DOWNLOADING, LOADING}:

@@ -90,10 +90,20 @@ def _normalize_url(field: str, value: str) -> str:
     value = (value or "").strip().rstrip("/")
     if not value:
         return ""
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+        parsed.port  # raises on a malformed port
+    except ValueError:
+        raise SettingsError(f"{field} must be an http:// or https:// URL.") from None
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise SettingsError(f"{field} must be an http:// or https:// URL.")
     return value
+
+
+COMPUTE_TYPES = frozenset(
+    {"auto", "default", "int8", "int8_float32", "int8_float16", "int8_bfloat16", "int16",
+     "float16", "bfloat16", "float32"}
+)
 
 
 def validate_values(values: dict[str, Any], *, check_models: bool = True) -> dict[str, Any]:
@@ -104,8 +114,11 @@ def validate_values(values: dict[str, Any], *, check_models: bool = True) -> dic
     cleaned["compute_type"] = str(cleaned.get("compute_type") or "").strip().lower()
     cleaned["english_engine"] = str(cleaned.get("english_engine") or "").strip().lower()
     cleaned["device"] = str(cleaned.get("device") or "").strip().lower()
-    if not cleaned["compute_type"]:
-        raise SettingsError("Compute type cannot be empty.")
+    if cleaned["compute_type"] not in COMPUTE_TYPES:
+        raise SettingsError(f"Compute type must be one of: {', '.join(sorted(COMPUTE_TYPES))}.")
+    if cleaned["device"] == "cpu" and "float16" in cleaned["compute_type"]:
+        # CTranslate2 refuses fp16 on the CPU, so every model load would fail.
+        raise SettingsError("float16 compute types need a CUDA GPU. Use auto or int8 on the CPU.")
     if cleaned["english_engine"] not in {"whisper", "parakeet"}:
         raise SettingsError("English engine must be whisper or parakeet.")
     if cleaned["device"] not in {"auto", "cpu", "cuda"}:
@@ -186,7 +199,11 @@ class SettingsStore:
         for field, env in self.locked.items():
             if field in payload:
                 current = serialize_value(field, self._base(field))
-                if serialize_value(field, parse_value(field, payload[field])) != current:
+                try:
+                    proposed = serialize_value(field, parse_value(field, payload[field]))
+                except (TypeError, ValueError):
+                    raise SettingsError(f"Invalid value for {field}.") from None
+                if proposed != current:
                     raise EnvLockedError(field, env)
         incoming: dict[str, Any] = {}
         for field, raw in payload.items():

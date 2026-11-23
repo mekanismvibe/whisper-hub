@@ -11,6 +11,7 @@ import secrets
 import socket
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -458,6 +459,11 @@ def create_app(
 
     engine_factory = engine_factory or WhisperEngine
     engine = engine or engine_factory(config)
+    try:
+        catalog.validate_models(config.model, config.translate_model)
+    except ValueError as exc:
+        # Env-pinned models skip the UI's validation; make the misconfiguration loud.
+        logger.error("model configuration problem: %s", exc)
     if config.uses_turbo_without_translator:
         logger.warning(
             "WHUB_MODEL=%s cannot translate. Set WHUB_TRANSLATE_MODEL "
@@ -1105,7 +1111,13 @@ def create_app(
         store: SettingsStore = request.app.state.settings
         manager: EngineManager = request.app.state.manager
         payload = await _json_body(request)
-        if manager.busy and set(payload) & ENGINE_RELOAD_FIELDS:
+        snapshot = store.snapshot()
+        # Only fields whose value actually changes count: the dashboard posts every field.
+        changing = {
+            field for field in set(payload) & ENGINE_RELOAD_FIELDS
+            if str(payload[field]).strip().lower() != str(snapshot.get(field)).strip().lower()
+        }
+        if manager.busy and changing:
             raise ApiError(
                 409,
                 "A model is already loading. Wait for it to finish and save again.",
@@ -1131,6 +1143,15 @@ def create_app(
             raise ApiError(400, str(exc), code="invalid_setting") from None
         request.app.state.config = new_config
         _sync_upload_limit(new_config)
+        # Per-request settings the running engine reads from its own config.
+        active = request.app.state.engine
+        if isinstance(getattr(active, "config", None), Config):
+            active.config = replace(
+                active.config,
+                beam_size=new_config.beam_size,
+                lang_confidence=new_config.lang_confidence,
+                honor_client_language=new_config.honor_client_language,
+            )
         if new_config.max_concurrency != old.max_concurrency:
             request.app.state.semaphore = asyncio.Semaphore(new_config.max_concurrency)
         engine_changed = request.app.state.manager.status()["state"] == "error" and bool(

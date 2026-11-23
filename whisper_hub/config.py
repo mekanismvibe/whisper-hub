@@ -59,8 +59,9 @@ def load_dotenv(path: Path) -> dict[str, str]:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
+        if value[:1] in "\"'" and value and value.find(value[0], 1) > 0:
+            # Quoted value, possibly followed by an inline comment: keep only the quoted part.
+            value = value[1 : value.find(value[0], 1)]
         elif " #" in value:
             value = value.split(" #", 1)[0].rstrip()
         if key:
@@ -163,5 +164,8 @@ class Config:
             lang_confidence=_parse_float(get("LANG_CONFIDENCE"), 0.5, "WHUB_LANG_CONFIDENCE"),
             english_engine=(get("ENGLISH_ENGINE") or "whisper").strip().lower(),
             parakeet_model=(get("PARAKEET_MODEL") or "moondream/parakeet-ultra").strip(),
-            env_names=frozenset(key for key in merged if key.startswith("WHUB_")),
+            # Blank variables (``WHUB_MODEL=``) mean "unset", so they must not lock a setting.
+            env_names=frozenset(
+                key for key, value in merged.items() if key.startswith("WHUB_") and str(value).strip()
+            ),
         )

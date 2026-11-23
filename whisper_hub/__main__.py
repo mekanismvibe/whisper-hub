@@ -36,7 +36,13 @@ def main(argv: list[str] | None = None) -> int:
         overrides["port"] = args.port
     if overrides:
         config = replace(config, **overrides)
-    run(config)
+    try:
+        run(config)
+    except ValueError as exc:
+        # Out-of-range WHUB_* values (beam size 50, a malformed URL, ...) fail settings
+        # validation inside create_app; report them like any other configuration error.
+        print(f"whisper-hub: configuration error: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

@@ -147,3 +147,62 @@ def test_json_endpoints_reject_large_bodies(client: TestClient):
 
 def test_non_ascii_setup_token_is_not_a_500(client: TestClient):
     assert client.get("/api/setup/status", params={"token": "é"}).status_code == 200
+
+
+def test_per_request_settings_reach_the_running_engine(client_factory):
+    from whisper_hub.config import Config as _Config
+
+    client, fake, _ = client_factory()
+    fake.config = _Config(model="fake-model", preload=False)
+    from .conftest import ADMIN_PASSWORD
+
+    client.post("/api/login", json={"password": ADMIN_PASSWORD})
+    saved = client.post("/api/admin/settings", json={"beam_size": 2, "lang_confidence": 0.8, "honor_client_language": True})
+    assert saved.status_code == 200 and saved.json()["reload_requested"] is False
+    assert (fake.config.beam_size, fake.config.lang_confidence, fake.config.honor_client_language) == (2, 0.8, True)
+
+
+def test_blank_env_vars_do_not_lock_settings():
+    from whisper_hub.config import Config as _Config
+
+    config = _Config.from_env({"WHUB_MODEL": "", "WHUB_PUBLIC_URL": " ", "WHUB_BEAM_SIZE": "3"})
+    assert config.env_names == frozenset({"WHUB_BEAM_SIZE"})
+
+
+def test_dotenv_quoted_value_with_inline_comment(tmp_path):
+    from whisper_hub.config import load_dotenv
+
+    path = tmp_path / ".env"
+    path.write_text('WHUB_MODEL="small" # main model\nWHUB_X=plain # note\n', encoding="utf-8")
+    assert load_dotenv(path) == {"WHUB_MODEL": "small", "WHUB_X": "plain"}
+
+
+def test_cpu_float16_and_bogus_compute_types_are_rejected(admin: TestClient):
+    assert admin.post("/api/admin/settings", json={"device": "cpu", "compute_type": "float16"}).status_code == 400
+    assert admin.post("/api/admin/settings", json={"compute_type": "bogus"}).status_code == 400
+    assert admin.post("/api/admin/settings", json={"public_url": "http://["}).status_code == 400
+
+
+def test_unchanged_model_fields_do_not_block_saves_during_a_swap(admin: TestClient):
+    manager = admin.app.state.manager
+    current = admin.get("/api/admin/settings").json()["values"]
+    import threading
+
+    gate = threading.Event()
+    manager.request_swap(lambda: gate.wait(5) or (_ for _ in ()).throw(RuntimeError("stop")), model="x")
+    try:
+        response = admin.post("/api/admin/settings", json={"model": current["model"], "beam_size": 4})
+        assert response.status_code == 200, response.text
+        assert admin.post("/api/admin/settings", json={"model": "tiny"}).status_code == 409
+    finally:
+        gate.set()
+        manager.wait(5)
+
+
+def test_status_reflects_lazy_loads(client_factory):
+    client, fake, _ = client_factory()
+    fake.models_loaded = False
+    manager = client.app.state.manager
+    manager.set_error("Model preload failed.")
+    fake.models_loaded = True  # a later request loaded the models lazily
+    assert manager.status()["state"] == "ready"
