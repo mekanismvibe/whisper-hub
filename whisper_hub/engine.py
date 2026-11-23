@@ -339,6 +339,16 @@ def _run_hybrid_policy(
     )
 
 
+def cuda_usable() -> bool:
+    """True when device=auto would pick the GPU."""
+    try:
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0 and _cuda_runtime_available()
+    except Exception:
+        return False
+
+
 def _cuda_runtime_available() -> bool:
     """CTranslate2 dlopens cuBLAS 12 and cuDNN 9 at first use; a GPU alone is not enough."""
     import ctypes

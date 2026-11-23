@@ -145,6 +145,14 @@ def validate_values(values: dict[str, Any], *, check_models: bool = True) -> dic
             catalog.validate_models(cleaned["model"], cleaned["translate_model"])
         except ValueError as exc:
             raise SettingsError(str(exc)) from None
+        if cleaned["device"] == "auto" and "float16" in cleaned["compute_type"]:
+            from .engine import cuda_usable
+
+            if not cuda_usable():
+                raise SettingsError(
+                    "No usable CUDA GPU was found, so float16 compute types would fail. "
+                    "Use auto or int8."
+                )
     return cleaned
 
 

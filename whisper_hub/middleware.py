@@ -29,8 +29,10 @@ class BodyLimitMiddleware:
             return
 
         threshold, limit_mb = self._limits()
-        if not scope.get("path", "").startswith(UPLOAD_PATHS):
+        upload = scope.get("path", "").startswith(UPLOAD_PATHS)
+        if not upload:
             threshold = min(threshold, JSON_BODY_LIMIT)
+            limit_mb = None
         headers = {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope["headers"]}
         declared = headers.get("content-length")
         if declared:
@@ -66,11 +68,13 @@ class BodyLimitMiddleware:
                 raise
             await self._reject(send, limit_mb)
 
-    async def _reject(self, send: Send, limit_mb: int) -> None:
+    async def _reject(self, send: Send, limit_mb: int | None) -> None:
         body = json.dumps(
             {
                 "error": {
-                    "message": f"Upload exceeds the {limit_mb} MB limit.",
+                    "message": (
+                        f"Upload exceeds the {limit_mb} MB limit." if limit_mb else "Request body too large."
+                    ),
                     "type": "invalid_request_error",
                     "code": "payload_too_large",
                 }

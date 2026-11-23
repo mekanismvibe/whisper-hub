@@ -69,7 +69,7 @@ def test_translation_format_headers_and_verbose_language(admin: TestClient):
     assert response.status_code == 200
     body = response.json()
     assert body["task"] == "translate"
-    assert body["language"] == "spanish"
+    assert body["language"] == "english"  # translations report the output language
     assert response.headers["X-Whub-Task"] == "translate"
     assert response.headers["X-Whub-Detected-Language"] == "es"
 

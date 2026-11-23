@@ -206,3 +206,44 @@ def test_status_reflects_lazy_loads(client_factory):
     manager.set_error("Model preload failed.")
     fake.models_loaded = True  # a later request loaded the models lazily
     assert manager.status()["state"] == "ready"
+
+
+def test_queue_of_waiting_uploads_is_bounded(admin: TestClient):
+    _, key, _ = create_and_pair(admin)
+    limiter = admin.app.state.limiter
+    limiter.admitted = max(4, 4 * limiter.limit)  # pretend the queue is full
+    try:
+        response = admin.post("/v1/audio/transcriptions", headers=auth(key), files={"file": FILE})
+        assert response.status_code == 503 and response.headers["retry-after"]
+    finally:
+        limiter.admitted = 0
+
+
+def test_max_concurrency_resize_keeps_one_limiter(admin: TestClient):
+    limiter = admin.app.state.limiter
+    assert admin.post("/api/admin/settings", json={"max_concurrency": 3}).status_code == 200
+    assert admin.app.state.limiter is limiter and limiter.limit == 3
+
+
+def test_null_origin_is_refused(admin: TestClient):
+    response = admin.post("/api/admin/devices", json={"name": "x", "kind": "other"}, headers={"Origin": "null"})
+    assert response.status_code == 403
+
+
+def test_history_write_failure_still_returns_text(admin: TestClient):
+    import sqlite3
+
+    _, key, _ = create_and_pair(admin)
+    db = admin.app.state.db
+
+    def broken(**kwargs):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    original, db.insert_transcription = db.insert_transcription, broken
+    try:
+        response = admin.post(
+            "/v1/audio/transcriptions", headers=auth(key), files={"file": FILE}, data={"response_format": "text"}
+        )
+    finally:
+        db.insert_transcription = original
+    assert response.status_code == 200 and response.text == "Hello world."

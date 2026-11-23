@@ -46,10 +46,11 @@ def render_vtt(result: TranscriptionResult) -> str:
     return "\n".join(blocks)
 
 
-def verbose_json(result: TranscriptionResult) -> dict[str, Any]:
+def verbose_json(result: TranscriptionResult, *, translation: bool = False) -> dict[str, Any]:
     return {
         "task": result.task,
-        "language": language_name(result.detected_language),
+        # OpenAI's translation response reports the output language, which is always English.
+        "language": "english" if translation else language_name(result.detected_language),
         "duration": result.duration_s,
         "text": result.text,
         "segments": [{**_SEGMENT_DEFAULTS, **segment} for segment in result.segments],

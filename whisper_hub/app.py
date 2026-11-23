@@ -9,6 +9,7 @@ import json
 import logging
 import secrets
 import socket
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -46,7 +47,7 @@ from .errors import ApiError, DecodeError, EngineBusyError, PayloadTooLarge
 from .formats import RESPONSE_FORMATS, render_srt, render_vtt, verbose_json
 from .guides import guides_for_setup, setup_payload
 from .manager import EngineManager
-from .middleware import BodyLimitMiddleware, RotatingSessionMiddleware
+from .middleware import UPLOAD_PATHS, BodyLimitMiddleware, RotatingSessionMiddleware
 from .pages import render_error_page, render_pair_page, render_setup_page
 from .settings import ENGINE_RELOAD_FIELDS, EnvLockedError, SettingsError, SettingsStore
 
@@ -84,6 +85,8 @@ def _wants_json(request: Request) -> bool:
 async def _json_body(request: Request) -> dict[str, Any]:
     try:
         payload = await request.json()
+    except PayloadTooLarge:
+        raise
     except Exception:
         raise ApiError(400, "Request body must be valid JSON.", code="invalid_json") from None
     if not isinstance(payload, dict):
@@ -207,18 +210,70 @@ def _normalize_language(value: str | None) -> str | None:
     return by_name.get(value.strip().lower())
 
 
+class InferenceLimiter:
+    """Concurrency cap for model calls that can be resized while requests are in flight."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.active = 0
+        self.admitted = 0
+        self._cond = asyncio.Condition()
+
+    @asynccontextmanager
+    async def slot(self):
+        async with self._cond:
+            await self._cond.wait_for(lambda: self.active < self.limit)
+            self.active += 1
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self.active -= 1
+                self._cond.notify_all()
+
+    async def resize(self, limit: int) -> None:
+        async with self._cond:
+            self.limit = limit
+            self._cond.notify_all()
+
+
+@asynccontextmanager
+async def _admission(request: Request):
+    """Bound how many uploads may sit in memory waiting for the model."""
+    limiter: InferenceLimiter = request.app.state.limiter
+    cap = max(4, 4 * limiter.limit)
+    if limiter.admitted >= cap:
+        raise ApiError(
+            503,
+            "The server is busy with other transcriptions. Try again in a moment.",
+            type_="server_error",
+            code="server_busy",
+            headers={"Retry-After": "5"},
+        )
+    limiter.admitted += 1
+    try:
+        yield
+    finally:
+        limiter.admitted -= 1
+
+
 async def _transcribe(
     request: Request, data: bytes, *, prompt: str | None, language: str | None
 ) -> tuple[TranscriptionResult, int]:
     started = time.perf_counter()
     try:
-        async with request.app.state.semaphore:
+        async with request.app.state.limiter.slot():
+            if await request.is_disconnected():
+                # Nobody is waiting for this text any more; don't spend GPU time on it.
+                raise ApiError(400, "The client disconnected.", code="client_disconnected")
             result = await asyncio.to_thread(
                 request.app.state.engine.transcribe_bytes,
                 data,
                 prompt=prompt,
                 language=language,
             )
+    except ApiError:
+        raise
     except DecodeError:
         raise ApiError(400, "Could not decode the uploaded audio.", code="invalid_audio") from None
     except EngineBusyError:
@@ -242,6 +297,17 @@ def _store(
 ) -> dict[str, Any] | None:
     if not result.text.strip():
         return None
+    try:
+        return _insert(request, device_id, result, processing_ms, endpoint)
+    except sqlite3.Error as exc:
+        # The caller still gets its text; only the history entry is lost.
+        logger.error("could not store a transcription (%s)", type(exc).__name__)
+        return None
+
+
+def _insert(
+    request: Request, device_id: int, result: TranscriptionResult, processing_ms: int, endpoint: str
+) -> dict[str, Any] | None:
     return request.app.state.db.insert_transcription(
         device_id=device_id,
         text=result.text,
@@ -266,14 +332,16 @@ def _response_headers(result: TranscriptionResult, row: dict[str, Any] | None) -
     return headers
 
 
-def _audio_response(result: TranscriptionResult, response_format: str, row: dict[str, Any] | None) -> Response:
+def _audio_response(
+    result: TranscriptionResult, response_format: str, row: dict[str, Any] | None, endpoint: str = ""
+) -> Response:
     headers = _response_headers(result, row)
     if response_format == "json":
         return JSONResponse({"text": result.text}, headers=headers)
     if response_format == "text":
         return Response(result.text, media_type="text/plain; charset=utf-8", headers=headers)
     if response_format == "verbose_json":
-        return JSONResponse(verbose_json(result), headers=headers)
+        return JSONResponse(verbose_json(result, translation=endpoint == "translations"), headers=headers)
     if response_format == "srt":
         return Response(render_srt(result), media_type="application/x-subrip; charset=utf-8", headers=headers)
     if response_format == "vtt":
@@ -391,7 +459,10 @@ def _expected_model_bytes(config: Config) -> int:
 
 def _sync_upload_limit(config: Config) -> None:
     # Keep multipart spools in RAM; the body limiter rejects anything above the cap.
-    MultiPartParser.spool_max_size = max(config.max_upload_bytes + 8 * 1024 * 1024, 16 * 1024 * 1024)
+    # Only ever raised: lowering it while an upload streams could roll that upload to disk.
+    MultiPartParser.spool_max_size = max(
+        MultiPartParser.spool_max_size, config.max_upload_bytes + 8 * 1024 * 1024, 16 * 1024 * 1024
+    )
 
 
 def _start_engine_swap(app: FastAPI, new_config: Config, fields: set[str]) -> bool:
@@ -544,7 +615,8 @@ def create_app(
     app.state.setup_required = setup_required
     app.state.setup_token = setup_token
     app.state.legacy_migrated = legacy_migrated
-    app.state.semaphore = asyncio.Semaphore(config.max_concurrency)
+    app.state.limiter = InferenceLimiter(config.max_concurrency)
+    app.state.device_seen = {}
     app.state.login_limiter = LoginLimiter()
     app.state.login_lock = asyncio.Lock()
     app.state.web_device_id = web_device["id"]
@@ -568,7 +640,13 @@ def create_app(
         # service could forge admin requests. Refuse unsafe cross-origin browser requests.
         if request.method not in ("GET", "HEAD", "OPTIONS") and not request.url.path.startswith("/v1/"):
             origin = request.headers.get("origin")
-            if origin and origin != "null":
+            if origin == "null":
+                # Opaque origins (sandboxed iframes, data: URLs) are never the dashboard.
+                return JSONResponse(
+                    ApiError(403, "Cross-origin request refused.", code="cross_origin").body(),
+                    status_code=403,
+                )
+            if origin:
                 if urlparse(origin).netloc.lower() != (request.headers.get("host") or "").lower():
                     return JSONResponse(
                         ApiError(403, "Cross-origin request refused.", code="cross_origin").body(),
@@ -603,7 +681,11 @@ def create_app(
         return JSONResponse(
             {
                 "error": {
-                    "message": f"Upload exceeds the {request.app.state.config.max_upload_mb} MB limit.",
+                    "message": (
+                        f"Upload exceeds the {request.app.state.config.max_upload_mb} MB limit."
+                        if request.url.path.startswith(UPLOAD_PATHS)
+                        else "Request body too large."
+                    ),
                     "type": "invalid_request_error",
                     "code": "payload_too_large",
                 }
@@ -662,6 +744,10 @@ def create_app(
         return {"id": device["id"], "name": device["display_name"], "kind": device["kind"]}
 
     async def audio_endpoint(request: Request, device: dict[str, Any], endpoint: str) -> Response:
+        async with _admission(request):
+            return await _audio_endpoint(request, device, endpoint)
+
+    async def _audio_endpoint(request: Request, device: dict[str, Any], endpoint: str) -> Response:
         data, fields = await _read_audio_form(request)
         requested = fields.get("response_format") or request.query_params.get("response_format")
         if not requested:
@@ -684,7 +770,7 @@ def create_app(
             language=_normalize_language(fields.get("language")),
         )
         row = _store(request, device["id"], result, processing_ms, endpoint)
-        return _audio_response(result, response_format, row)
+        return _audio_response(result, response_format, row, endpoint)
 
     @app.post("/v1/audio/transcriptions")
     async def transcriptions(request: Request, device: dict[str, Any] = Depends(require_device)) -> Response:
@@ -1068,6 +1154,10 @@ def create_app(
 
     @admin.post("/web-transcribe")
     async def admin_web_transcribe(request: Request) -> dict[str, Any]:
+        async with _admission(request):
+            return await _web_transcribe(request)
+
+    async def _web_transcribe(request: Request) -> dict[str, Any]:
         data, fields = await _read_audio_form(request)
         result, processing_ms = await _transcribe(
             request,
@@ -1153,7 +1243,7 @@ def create_app(
                 honor_client_language=new_config.honor_client_language,
             )
         if new_config.max_concurrency != old.max_concurrency:
-            request.app.state.semaphore = asyncio.Semaphore(new_config.max_concurrency)
+            await request.app.state.limiter.resize(new_config.max_concurrency)
         engine_changed = request.app.state.manager.status()["state"] == "error" and bool(
             set(payload) & ENGINE_RELOAD_FIELDS
         )

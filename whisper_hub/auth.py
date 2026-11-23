@@ -66,7 +66,16 @@ async def require_device(request: Request) -> dict[str, Any]:
             code="invalid_api_key",
         )
     client = request.client
-    db.touch_device(device["id"], client.host if client else None, request.headers.get("user-agent"))
+    ip = client.host if client else None
+    agent = request.headers.get("user-agent")
+    # last-seen is display-only: one DB write per device per minute (or when the
+    # address/client changes) instead of a synchronous commit on every request.
+    seen: dict[int, tuple[float, Any, Any]] = request.app.state.device_seen
+    previous = seen.get(device["id"])
+    now = time.monotonic()
+    if previous is None or now - previous[0] > 60 or previous[1:] != (ip, agent):
+        seen[device["id"]] = (now, ip, agent)
+        db.touch_device(device["id"], ip, agent)
     return device
 
 
