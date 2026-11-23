@@ -156,16 +156,28 @@ def decode_cursor(cursor: str | None) -> tuple[str, int] | None:
         raise ValueError("invalid cursor") from None
 
 
+class _Connection(sqlite3.Connection):
+    """``with conn:`` commits/rolls back *and* closes, so write helpers do not leak handles."""
+
+    def __exit__(self, exc_type, exc, tb):  # type: ignore[override]
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 class Database:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self._write_lock = threading.RLock()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30)
+        conn = sqlite3.connect(self.path, timeout=30, factory=_Connection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 30000")
+        # Deleted transcripts are overwritten on disk instead of lingering in free pages.
+        conn.execute("PRAGMA secure_delete = ON")
         return conn
 
     def initialize(self) -> None:
@@ -277,6 +289,10 @@ class Database:
                 "WHERE id = ?",
                 (utc_now_iso(), device_id),
             )
+            # An outstanding QR/link must not be able to re-activate a revoked device.
+            conn.execute(
+                "DELETE FROM pairing_codes WHERE device_id = ? AND claimed_at IS NULL", (device_id,)
+            )
 
     def touch_device(self, device_id: int, ip: str | None, user_agent: str | None) -> None:
         with self._write_lock, self._connect() as conn:
@@ -287,32 +303,30 @@ class Database:
 
     def delete_device(self, device_id: int, *, delete_history: bool) -> bool:
         with self._write_lock, self._connect() as conn:
-            with conn:
-                if delete_history:
-                    conn.execute("DELETE FROM transcriptions WHERE device_id = ?", (device_id,))
-                    cur = conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
-                    return cur.rowcount > 0
-                cur = conn.execute(
-                    "UPDATE devices SET deleted_at = ?, status = 'revoked', key_hash = NULL, key_prefix = NULL "
-                    "WHERE id = ? AND deleted_at IS NULL",
-                    (utc_now_iso(), device_id),
-                )
-                conn.execute("DELETE FROM pairing_codes WHERE device_id = ?", (device_id,))
+            if delete_history:
+                conn.execute("DELETE FROM transcriptions WHERE device_id = ?", (device_id,))
+                cur = conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
                 return cur.rowcount > 0
+            cur = conn.execute(
+                "UPDATE devices SET deleted_at = ?, status = 'revoked', key_hash = NULL, key_prefix = NULL "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (utc_now_iso(), device_id),
+            )
+            conn.execute("DELETE FROM pairing_codes WHERE device_id = ?", (device_id,))
+            return cur.rowcount > 0
 
     # ------------------------------------------------------------------ pairing
 
     def create_pairing_code(self, device_id: int, code_hash: str, expires_at: str) -> None:
         now = utc_now_iso()
         with self._write_lock, self._connect() as conn:
-            with conn:
-                conn.execute(
-                    "DELETE FROM pairing_codes WHERE device_id = ? AND claimed_at IS NULL", (device_id,)
-                )
-                conn.execute(
-                    "INSERT INTO pairing_codes (code_hash, device_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-                    (code_hash, device_id, now, expires_at),
-                )
+            conn.execute(
+                "DELETE FROM pairing_codes WHERE device_id = ? AND claimed_at IS NULL", (device_id,)
+            )
+            conn.execute(
+                "INSERT INTO pairing_codes (code_hash, device_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (code_hash, device_id, now, expires_at),
+            )
 
     def get_pairing(self, code_hash: str) -> dict[str, Any] | None:
         conn = self._connect()
@@ -391,31 +405,34 @@ class Database:
         model: str | None,
         endpoint: str | None,
         client_user_agent: str | None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         created_at = utc_now_iso()
-        with self._write_lock, self._connect() as conn:
-            cur = conn.execute(
-                "INSERT INTO transcriptions (device_id, created_at, text, detected_language, "
-                "language_probability, task, audio_duration_s, processing_ms, model, endpoint, "
-                "client_user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    device_id,
-                    created_at,
-                    text,
-                    detected_language,
-                    language_probability,
-                    task,
-                    audio_duration_s,
-                    processing_ms,
-                    model,
-                    endpoint,
-                    (client_user_agent or "")[:500] or None,
-                ),
-            )
-            row_id = int(cur.lastrowid)
-        item = self.get_transcription(row_id)
-        assert item is not None
-        return item
+        try:
+            with self._write_lock, self._connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO transcriptions (device_id, created_at, text, detected_language, "
+                    "language_probability, task, audio_duration_s, processing_ms, model, endpoint, "
+                    "client_user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        device_id,
+                        created_at,
+                        text,
+                        detected_language,
+                        language_probability,
+                        task,
+                        audio_duration_s,
+                        processing_ms,
+                        model,
+                        endpoint,
+                        (client_user_agent or "")[:500] or None,
+                    ),
+                )
+                row_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            # The device was hard-deleted while this request was transcribing: the caller
+            # still gets its text, the history simply does not keep it.
+            return None
+        return self.get_transcription(row_id)
 
     def get_transcription(self, row_id: int) -> dict[str, Any] | None:
         conn = self._connect()
@@ -444,6 +461,9 @@ class Database:
                 "t.id IN (SELECT rowid FROM transcriptions_fts WHERE transcriptions_fts MATCH ?)"
             )
             params.append(query)
+        elif (q or "").strip():
+            # Punctuation/emoji-only search: nothing can match, not "everything matches".
+            return [], False
         if before is not None:
             clauses.append("(t.created_at < ? OR (t.created_at = ? AND t.id < ?))")
             params.extend([before[0], before[0], before[1]])
@@ -504,9 +524,18 @@ class Database:
         return [self._transcription(row) for row in rows]
 
     def clear_transcriptions(self) -> int:
-        with self._write_lock, self._connect() as conn:
-            cur = conn.execute("DELETE FROM transcriptions")
-            return cur.rowcount
+        with self._write_lock:
+            with self._connect() as conn:
+                cur = conn.execute("DELETE FROM transcriptions")
+                count = cur.rowcount
+                # Merge FTS segments so deleted tokens leave the index blobs too.
+                conn.execute("INSERT INTO transcriptions_fts(transcriptions_fts) VALUES('optimize')")
+            conn = self._connect()
+            try:
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+        return count
 
     # ------------------------------------------------------------------ settings
 

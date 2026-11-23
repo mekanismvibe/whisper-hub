@@ -572,6 +572,11 @@ def create_app(
             status_code=413,
         )
 
+    @app.exception_handler(OverflowError)
+    async def overflow_handler(request: Request, exc: OverflowError) -> JSONResponse:
+        # Ids/cursors beyond SQLite's 64-bit range cannot exist; treat them as bad input.
+        return JSONResponse(ApiError(400, "Number out of range.", code="invalid_parameter").body(), status_code=400)
+
     # ------------------------------------------------------------ public endpoints
 
     @app.get("/healthz")
@@ -1160,9 +1165,17 @@ def create_app(
                 buffer, fieldnames=["created_at", "device", "detected_language", "task", "text"]
             )
             writer.writeheader()
-            writer.writerows(rows)
+            # Spreadsheets evaluate cells starting with = + - @ as formulas; any paired device
+            # can put arbitrary text in the history, so neutralize them.
+            writer.writerows(
+                {
+                    key: ("'" + value if isinstance(value, str) and value[:1] in "=+-@\t\r" and value else value)
+                    for key, value in row.items()
+                }
+                for row in rows
+            )
             return Response(
-                buffer.getvalue(),
+                "\ufeff" + buffer.getvalue(),
                 media_type="text/csv; charset=utf-8",
                 headers={"Content-Disposition": 'attachment; filename="whisper-hub-history.csv"'},
             )

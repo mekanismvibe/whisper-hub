@@ -150,7 +150,7 @@ def test_export_and_delete_all_history(admin: TestClient):
     assert "attachment" in exported.headers["content-disposition"]
 
     csv_export = admin.get("/api/admin/export?format=csv")
-    assert csv_export.text.splitlines()[0] == "created_at,device,detected_language,task,text"
+    assert csv_export.text.splitlines()[0] == "\ufeffcreated_at,device,detected_language,task,text"
     assert "Export me." in csv_export.text
 
     assert admin.get("/api/admin/export?format=xml").status_code == 400
