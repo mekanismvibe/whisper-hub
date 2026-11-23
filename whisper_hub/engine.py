@@ -60,6 +60,9 @@ def _segment_dict(segment: Any, index: int) -> dict[str, Any]:
         "end": float(getattr(segment, "end", 0.0)),
         "text": getattr(segment, "text", ""),
     }
+    tokens = getattr(segment, "tokens", None)
+    if tokens is not None:
+        item["tokens"] = list(tokens)
     for attr in ("seek", "temperature", "avg_logprob", "compression_ratio", "no_speech_prob"):
         value = getattr(segment, attr, None)
         if value is not None:
@@ -105,6 +108,20 @@ def _parakeet_segment_dict(segment: Any, index: int) -> dict[str, Any]:
     }
 
 
+def _is_multilingual(model: Any) -> bool:
+    """English-only checkpoints (*.en, distil) cannot detect languages or translate."""
+    return bool(getattr(getattr(model, "model", None), "is_multilingual", True))
+
+
+def _detector(models: ModelSource) -> Any | None:
+    """The model whose language head decides routing; None when no model can detect."""
+    model, _ = models.get_model(translate=False)
+    if _is_multilingual(model):
+        return model
+    translator, _ = models.get_model(translate=True)
+    return translator if _is_multilingual(translator) else None
+
+
 def run_policy(
     models: ModelSource,
     audio: Any,
@@ -134,6 +151,19 @@ def run_policy(
         )
     model, model_name = models.get_model(translate=False)
     language = language_hint if honor_client_language else None
+    if language is None and not _is_multilingual(model):
+        # An English-only main model reports every clip as English; let the multilingual
+        # translator detect so non-English speech is still translated.
+        detector = _detector(models)
+        if detector is not None:
+            detected_hint, probability, _ = detector.detect_language(audio, vad_filter=True)
+            detected_hint = (detected_hint or "en").lower()
+            if detected_hint != "en":
+                return _translate_only(
+                    models, audio, detected=detected_hint, language_probability=probability,
+                    prompt=prompt, beam_size=beam_size,
+                )
+            language = "en"
     common: dict[str, Any] = {
         "vad_filter": True,
         "beam_size": beam_size,
@@ -186,6 +216,32 @@ def run_policy(
     )
 
 
+def _translate_only(
+    models: ModelSource,
+    audio: Any,
+    *,
+    detected: str,
+    language_probability: float | None,
+    prompt: str | None,
+    beam_size: int,
+) -> TranscriptionResult:
+    translator, translator_name = models.get_model(translate=True)
+    segments, info = translator.transcribe(
+        audio, task="translate", language=detected, vad_filter=True, beam_size=beam_size,
+        condition_on_previous_text=False, initial_prompt=prompt or None,
+    )
+    consumed = list(segments)
+    return TranscriptionResult(
+        text="".join(getattr(segment, "text", "") for segment in consumed).strip(),
+        detected_language=detected,
+        language_probability=language_probability,
+        task="translate",
+        duration_s=getattr(info, "duration", None),
+        segments=[_segment_dict(segment, index) for index, segment in enumerate(consumed)],
+        model=translator_name,
+    )
+
+
 def _audio_duration(audio: Any) -> float | None:
     try:
         return float(len(audio)) / 16000
@@ -216,8 +272,11 @@ def _run_hybrid_policy(
         detected = language_hint.lower()
         language_probability: float | None = 1.0
         english = detected == "en"
+    elif (detector := _detector(models)) is None:
+        # Only English-only models are configured: everything is English by definition.
+        detected, language_probability, english = "en", None, True
     else:
-        detected, language_probability, all_language_probs = model.detect_language(
+        detected, language_probability, all_language_probs = detector.detect_language(
             audio, vad_filter=True
         )
         detected = (detected or "en").lower()
@@ -445,12 +504,12 @@ class ParakeetModels:
         with self._lock:
             model = self._model
             self._model = None
-        if model is None:
-            return False
-        try:
-            model.close()
-        except Exception:
-            logger.warning("closing the parakeet model failed", exc_info=True)
+            if model is None:
+                return False
+            try:
+                model.close()
+            except Exception:
+                logger.warning("closing the parakeet model failed", exc_info=True)
         gc.collect()
         try:
             import torch
@@ -477,6 +536,13 @@ class WhisperEngine:
         if speech is None and config.english_engine == "parakeet":
             speech = ParakeetModels(config)
         self.speech = speech
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+        self._retired = False
+
+    @property
+    def busy(self) -> bool:
+        return self._inflight > 0
 
     @property
     def models_loaded(self) -> bool:
@@ -512,6 +578,24 @@ class WhisperEngine:
         prompt: str | None = None,
         language: str | None = None,
     ) -> TranscriptionResult:
+        with self._inflight_lock:
+            self._inflight += 1
+        try:
+            return self._transcribe_bytes(data, prompt=prompt, language=language)
+        finally:
+            self.models.touch()
+            touch = getattr(self.speech, "touch", None)
+            if callable(touch):
+                touch()
+            with self._inflight_lock:
+                self._inflight -= 1
+                release = self._retired and self._inflight == 0
+            if release:
+                self.unload()
+
+    def _transcribe_bytes(
+        self, data: bytes, *, prompt: str | None, language: str | None
+    ) -> TranscriptionResult:
         self.models.touch()
         try:
             from faster_whisper import decode_audio
@@ -540,6 +624,14 @@ class WhisperEngine:
             raise EngineBusyError("transcription failed") from exc
         finally:
             del audio
+
+    def retire(self) -> None:
+        """Called after a hot swap: free this engine's models once its last request ends."""
+        with self._inflight_lock:
+            self._retired = True
+            release = self._inflight == 0
+        if release:
+            self.unload()
 
     def unload(self) -> bool:
         unload = getattr(self.models, "unload", None)

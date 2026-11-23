@@ -377,3 +377,78 @@ def test_parakeet_models_load_lazily_and_unload(monkeypatch):
     assert photon.closed is True
     assert provider.models_loaded is False
     assert provider.unload() is False
+
+
+class EnglishOnlyModel(FakeWhisperModel):
+    """Mimics a *.en checkpoint: always reports English and cannot detect."""
+
+    model = SimpleNamespace(is_multilingual=False)
+
+    def __init__(self, text: str = "english only output") -> None:
+        super().__init__("en", text)
+
+    def detect_language(self, audio, **kwargs):
+        raise RuntimeError("detect_language can only be called on multilingual models")
+
+
+def test_english_only_main_model_still_translates_non_english():
+    translator = FakeWhisperModel("es", "translated text")
+    source = FakeModelSource(EnglishOnlyModel(), translator)
+    result = run_policy(source, np.zeros(16000, dtype=np.float32), prompt=None, language_hint=None,
+                        beam_size=5, honor_client_language=False)
+    assert result.task == "translate" and result.text == "translated text"
+    assert result.detected_language == "es"
+
+
+def test_english_only_main_model_transcribes_english_itself():
+    primary = EnglishOnlyModel()
+    source = FakeModelSource(primary, FakeWhisperModel("en", "unused"))
+    result = run_policy(source, np.zeros(16000, dtype=np.float32), prompt=None, language_hint=None,
+                        beam_size=5, honor_client_language=False)
+    assert result.task == "transcribe" and result.text == "english only output"
+
+
+def test_english_only_main_model_with_parakeet_does_not_crash():
+    speech = FakeSpeechSource(FakeSpeechModel())
+    source = FakeModelSource(EnglishOnlyModel(), FakeWhisperModel("en", "unused"))
+    result = run_policy(source, np.zeros(16000, dtype=np.float32), prompt=None, language_hint=None,
+                        beam_size=5, honor_client_language=False, speech=speech)
+    assert result.text == "hello from parakeet"
+
+
+def test_swapped_engine_is_released_after_its_last_request():
+    import threading
+
+    from whisper_hub.engine import WhisperEngine
+
+    class Models(FakeModelSource):
+        unloaded = 0
+
+        def unload(self):
+            Models.unloaded += 1
+            return True
+
+    gate = threading.Event()
+    inside = threading.Event()
+
+    class SlowModel(FakeWhisperModel):
+        def transcribe(self, audio, **kwargs):
+            inside.set()
+            gate.wait(5)
+            return super().transcribe(audio, **kwargs)
+
+    engine = WhisperEngine(Config(model="fake", preload=False), models=Models(SlowModel("en", "hi")))
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(16000); wav.writeframes(b"\x01\x00" * 16000)
+    worker = threading.Thread(target=engine.transcribe_bytes, args=(buf.getvalue(),))
+    worker.start()
+    assert inside.wait(5) and engine.busy
+    engine.retire()
+    assert Models.unloaded == 0  # still serving the in-flight request
+    gate.set()
+    worker.join(5)
+    assert Models.unloaded == 1 and not engine.busy

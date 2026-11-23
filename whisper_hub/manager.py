@@ -156,6 +156,7 @@ class EngineManager:
                 }
         else:
             with self._lock:
+                previous = self._engine
                 self._engine = engine
                 if self._on_swap is not None:
                     self._on_swap(engine)
@@ -167,6 +168,15 @@ class EngineManager:
                     "updated_at": time.time(),
                 }
             logger.info("model swap ready in %.1fs", time.monotonic() - started)
+            # Free the superseded engine's models (GPU memory, Photon clients) once the
+            # requests still using it have finished.
+            if previous is not engine:
+                retire = getattr(previous, "retire", None) or getattr(previous, "unload", None)
+                if callable(retire):
+                    try:
+                        retire()
+                    except Exception:
+                        logger.exception("releasing the previous engine failed")
         finally:
             stop.set()
             if monitor is not None:

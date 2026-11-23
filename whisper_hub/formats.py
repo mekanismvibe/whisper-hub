@@ -40,6 +40,8 @@ def render_vtt(result: TranscriptionResult) -> str:
         start = _timestamp(segment.get("start", 0.0), separator=".")
         end = _timestamp(segment.get("end", 0.0), separator=".")
         text = str(segment.get("text", "")).strip()
+        # Cue payloads are markup in WebVTT: escape it, and "-->" would end the cue header.
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         blocks.append(f"{start} --> {end}\n{text}\n")
     return "\n".join(blocks)
 
@@ -50,5 +52,17 @@ def verbose_json(result: TranscriptionResult) -> dict[str, Any]:
         "language": language_name(result.detected_language),
         "duration": result.duration_s,
         "text": result.text,
-        "segments": result.segments,
+        "segments": [{**_SEGMENT_DEFAULTS, **segment} for segment in result.segments],
     }
+
+
+# OpenAI's verbose_json marks these segment fields as required; strict SDK parsers reject
+# segments without them (Parakeet produces start/end/text only).
+_SEGMENT_DEFAULTS: dict[str, Any] = {
+    "seek": 0,
+    "tokens": [],
+    "temperature": 0.0,
+    "avg_logprob": 0.0,
+    "compression_ratio": 0.0,
+    "no_speech_prob": 0.0,
+}

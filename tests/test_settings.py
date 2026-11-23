@@ -179,6 +179,7 @@ def test_hot_swap_success_and_failure_paths(client_factory):
     assert client.app.state.manager.wait(5)
     assert client.app.state.engine is created[-1]
     assert client.app.state.engine is not old
+    assert old.unloaded, "the superseded engine must release its models"
     status = client.get("/api/admin/model-status").json()
     assert status["state"] == "ready"
     assert client.get("/healthz").json()["model"] == "base"
@@ -192,6 +193,7 @@ def test_hot_swap_success_and_failure_paths(client_factory):
     assert response.status_code == 200, response.text
     assert client.app.state.manager.wait(5)
     assert client.app.state.engine is current, "a failed load must keep the old engine"
+    assert not current.unloaded, "a failed load must not release the serving engine"
     status = client.get("/api/admin/model-status").json()
     assert status["state"] == "error"
     assert "cannot load that model" in status["message"]

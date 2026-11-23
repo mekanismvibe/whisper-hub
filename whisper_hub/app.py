@@ -39,6 +39,7 @@ from .auth import (
 from .config import DEVICE_KINDS, Config
 from .db import Database, decode_cursor, encode_cursor
 from .engine import EngineProtocol, TranscriptionResult, WhisperEngine
+from .languages import LANGUAGE_NAMES
 from .errors import ApiError, DecodeError, EngineBusyError, PayloadTooLarge
 from .formats import RESPONSE_FORMATS, render_srt, render_vtt, verbose_json
 from .guides import guides_for_setup, setup_payload
@@ -197,9 +198,11 @@ def _normalize_language(value: str | None) -> str | None:
     if not value:
         return None
     base = value.strip().lower().replace("_", "-").split("-")[0]
-    if 2 <= len(base) <= 3 and base.isalpha():
+    # Only codes Whisper knows; anything else ("eng", "xx") would make inference fail.
+    if base in LANGUAGE_NAMES:
         return base
-    return None
+    by_name = {name: code for code, name in LANGUAGE_NAMES.items()}
+    return by_name.get(value.strip().lower())
 
 
 async def _transcribe(
@@ -476,7 +479,8 @@ def create_app(
                 try:
                     active = app.state.engine
                     idle_for = getattr(active, "idle_seconds", 0.0)
-                    if idle_for >= timeout and active.models_loaded:
+                    busy = bool(getattr(active, "busy", False))
+                    if idle_for >= timeout and active.models_loaded and not busy:
                         await asyncio.to_thread(active.unload)
                 except asyncio.CancelledError:
                     raise
@@ -492,7 +496,7 @@ def create_app(
             config.translate_model_name,
             config.english_engine,
             config.parakeet_model if config.english_engine == "parakeet" else None,
-            getattr(engine, "device", config.device),
+            getattr(app.state.engine, "device", config.device),
             data_dir,
         )
         try:
