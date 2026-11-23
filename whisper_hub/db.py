@@ -9,6 +9,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 SCHEMA = """
@@ -178,12 +179,16 @@ class Database:
         conn.execute("PRAGMA busy_timeout = 30000")
         # Deleted transcripts are overwritten on disk instead of lingering in free pages.
         conn.execute("PRAGMA secure_delete = ON")
+        conn.execute("PRAGMA synchronous = NORMAL")
         return conn
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            # WAL lets history reads and new transcriptions proceed concurrently instead of a
+            # long write (delete-all, export) stalling every request. Persists in the file.
+            conn.execute("PRAGMA journal_mode = WAL")
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -212,9 +217,10 @@ class Database:
     def get_device_by_key_hash(self, key_hash: str) -> dict[str, Any] | None:
         conn = self._connect()
         try:
+            # Runs on every API request: plain row only, no history aggregates.
             row = conn.execute(
-                DEVICE_QUERY
-                + " WHERE d.key_hash = ? AND d.status = 'active' AND d.deleted_at IS NULL",
+                "SELECT d.* FROM devices d"
+                " WHERE d.key_hash = ? AND d.status = 'active' AND d.deleted_at IS NULL",
                 (key_hash,),
             ).fetchone()
         finally:
@@ -465,8 +471,8 @@ class Database:
             # Punctuation/emoji-only search: nothing can match, not "everything matches".
             return [], False
         if before is not None:
-            clauses.append("(t.created_at < ? OR (t.created_at = ? AND t.id < ?))")
-            params.extend([before[0], before[0], before[1]])
+            clauses.append("(t.created_at, t.id) < (?, ?)")
+            params.extend([before[0], before[1]])
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit + 1)
         conn = self._connect()
@@ -511,6 +517,28 @@ class Database:
             "devices_active": devices["active"] or 0,
             "devices_pending": devices["pending"] or 0,
         }
+
+    def iter_transcriptions(self, page_size: int = 2000) -> Iterator[list[dict[str, Any]]]:
+        """Every transcript in chronological order, one keyset page at a time.
+
+        A fresh connection per page: the export streams from a worker thread and must not
+        hold a read transaction (or a connection) across yields.
+        """
+        after: tuple[str, int] = ("", 0)
+        while True:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    TRANSCRIPTION_QUERY
+                    + " WHERE (t.created_at, t.id) > (?, ?) ORDER BY t.created_at ASC, t.id ASC LIMIT ?",
+                    (after[0], after[1], page_size),
+                ).fetchall()
+            finally:
+                conn.close()
+            if not rows:
+                return
+            after = (rows[-1]["created_at"], rows[-1]["id"])
+            yield [self._transcription(row) for row in rows]
 
     def all_transcriptions(self) -> list[dict[str, Any]]:
         """Every transcript in chronological order (used by the data export)."""

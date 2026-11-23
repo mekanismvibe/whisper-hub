@@ -14,6 +14,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any
@@ -21,7 +22,7 @@ from typing import Any
 import segno
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartParser
@@ -1315,40 +1316,64 @@ def create_app(
     @admin.get("/export")
     async def admin_export(request: Request) -> Response:
         fmt = (request.query_params.get("format") or "json").strip().lower()
-        rows = [
-            {
-                "created_at": item["created_at"],
-                "device": item["device_name"] or "Deleted device",
-                "detected_language": item["detected_language"],
-                "task": item["task"],
-                "text": item["text"],
-            }
-            for item in request.app.state.db.all_transcriptions()
-        ]
-        if fmt == "csv":
+        if fmt not in ("json", "csv"):
+            raise ApiError(400, "Export format must be json or csv.", code="invalid_format")
+        db_ = request.app.state.db
+        fields = ["created_at", "device", "detected_language", "task", "text"]
+
+        def pages() -> Iterator[list[dict[str, Any]]]:
+            for page in db_.iter_transcriptions():
+                yield [
+                    {
+                        "created_at": item["created_at"],
+                        "device": item["device_name"] or "Deleted device",
+                        "detected_language": item["detected_language"],
+                        "task": item["task"],
+                        "text": item["text"],
+                    }
+                    for item in page
+                ]
+
+        def csv_chunks() -> Iterator[str]:
             buffer = io.StringIO()
-            writer = csv.DictWriter(
-                buffer, fieldnames=["created_at", "device", "detected_language", "task", "text"]
-            )
+            writer = csv.DictWriter(buffer, fieldnames=fields)
+            buffer.write("\ufeff")
             writer.writeheader()
-            # Spreadsheets evaluate cells starting with = + - @ as formulas; any paired device
-            # can put arbitrary text in the history, so neutralize them.
-            writer.writerows(
-                {
-                    key: ("'" + value if isinstance(value, str) and value[:1] in "=+-@\t\r" and value else value)
-                    for key, value in row.items()
-                }
-                for row in rows
-            )
-            return Response(
-                "\ufeff" + buffer.getvalue(),
+            for rows in pages():
+                # Spreadsheets evaluate cells starting with = + - @ as formulas; any paired
+                # device can put arbitrary text in the history, so neutralize them.
+                writer.writerows(
+                    {
+                        key: ("'" + value if isinstance(value, str) and value[:1] in "=+-@\t\r" and value else value)
+                        for key, value in row.items()
+                    }
+                    for row in rows
+                )
+                yield buffer.getvalue()
+                buffer.seek(0)
+                buffer.truncate()
+            if buffer.getvalue():
+                yield buffer.getvalue()
+
+        def json_chunks() -> Iterator[str]:
+            # Same bytes as json.dumps(all_rows, indent=2), built one page at a time.
+            first = True
+            for rows in pages():
+                body = json.dumps(rows, ensure_ascii=False, indent=2)[2:-2]
+                yield ("[\n" if first else ",\n") + body
+                first = False
+            yield "[]" if first else "\n]"
+
+        # Streamed from a worker thread page by page: constant memory, and the event loop
+        # keeps serving dictations while a large history exports.
+        if fmt == "csv":
+            return StreamingResponse(
+                csv_chunks(),
                 media_type="text/csv; charset=utf-8",
                 headers={"Content-Disposition": 'attachment; filename="whisper-hub-history.csv"'},
             )
-        if fmt != "json":
-            raise ApiError(400, "Export format must be json or csv.", code="invalid_format")
-        return Response(
-            json.dumps(rows, ensure_ascii=False, indent=2),
+        return StreamingResponse(
+            json_chunks(),
             media_type="application/json; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="whisper-hub-history.json"'},
         )

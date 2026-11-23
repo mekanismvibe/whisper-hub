@@ -247,3 +247,30 @@ def test_history_write_failure_still_returns_text(admin: TestClient):
     finally:
         db.insert_transcription = original
     assert response.status_code == 200 and response.text == "Hello world."
+
+
+def test_streamed_export_matches_one_shot_export_across_pages(admin: TestClient, fake):
+    import csv
+    import functools
+    import io
+    import json
+
+    from .conftest import make_result
+
+    _, key, _ = create_and_pair(admin)
+    for index in range(5):
+        fake.push(make_result(text=f"Entry number {index} — ünïcode"))
+        admin.post("/v1/audio/transcriptions", headers=auth(key), files={"file": FILE})
+    db = admin.app.state.db
+    db.iter_transcriptions = functools.partial(type(db).iter_transcriptions, db, page_size=2)
+    expected = [
+        {"created_at": i["created_at"], "device": i["device_name"] or "Deleted device",
+         "detected_language": i["detected_language"], "task": i["task"], "text": i["text"]}
+        for i in db.all_transcriptions()
+    ]
+    body = admin.get("/api/admin/export?format=json").text
+    assert body == json.dumps(expected, ensure_ascii=False, indent=2)
+    rows = list(csv.DictReader(io.StringIO(admin.get("/api/admin/export?format=csv").text.lstrip("﻿"))))
+    assert [r["text"] for r in rows] == [r["text"] for r in expected]
+    admin.delete("/api/admin/history?confirm=DELETE")
+    assert admin.get("/api/admin/export?format=json").text == "[]"
