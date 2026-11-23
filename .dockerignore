@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+data
+data-dev
+data-test
+docs
+tests
+deploy
+compose*.yaml
+paseo.json
+.env

@@ -1,0 +1,15 @@
+# GPU override: docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
+services:
+  whisper-hub:
+    build:
+      context: .
+      args:
+        EXTRAS: cuda
+    image: whisper-hub:cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

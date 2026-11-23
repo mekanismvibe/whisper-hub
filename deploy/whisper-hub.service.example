@@ -1,0 +1,23 @@
+# Whisper Hub user service. Copy to ~/.config/systemd/user/whisper-hub.service,
+# adjust the paths, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now whisper-hub
+#
+# Runtime settings (models, device, URLs) live in the web UI. Use the optional
+# EnvironmentFile for host-specific environment variables only.
+[Unit]
+Description=Whisper Hub
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/whisper-hub
+Environment=WHUB_DATA_DIR=%h/whisper-hub/data
+Environment=WHUB_PORT=8765
+EnvironmentFile=-%h/whisper-hub/data/whisper-hub.env
+PrivateTmp=yes
+ExecStart=%h/whisper-hub/.venv/bin/whisper-hub
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

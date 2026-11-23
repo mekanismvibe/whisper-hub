@@ -1,0 +1,13 @@
+data/
+data-dev/
+data-test/
+.env
+.venv*/
+__pycache__/
+*.pyc
+bench/datasets/
+bench/models/
+.e2e/
+.pytest_cache/
+dist/
+.ruff_cache/

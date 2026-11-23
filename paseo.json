@@ -1,0 +1,14 @@
+{
+  "worktree": {
+    "setup": "uv sync"
+  },
+  "scripts": {
+    "dev": {
+      "type": "service",
+      "command": "WHUB_MODEL=tiny WHUB_DATA_DIR=./data-dev uv run whisper-hub --port $PASEO_PORT"
+    },
+    "check": {
+      "command": "uv run pytest -q -m \"not model\""
+    }
+  }
+}

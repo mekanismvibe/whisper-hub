@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#6d5efc" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#101014" media="(prefers-color-scheme: dark)">
+  <meta name="description" content="Whisper Hub — one Whisper server for every device.">
+  <title>Whisper Hub</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <div id="login-view" class="login-view" hidden>
+    <main class="login-card">
+      <div class="brand brand-large">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round"><path d="M3 12h2M7 8v8M11 4v16M15 7v10M19 10v4M21 12h0"/></svg>
+        </span>
+        <span>Whisper Hub</span>
+      </div>
+      <h1>Welcome back</h1>
+      <p class="login-lede">One server. Every device. English text everywhere.</p>
+      <form id="login-form" class="login-form" autocomplete="on">
+        <label for="login-password">Dashboard password</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password"
+               spellcheck="false" required autofocus>
+        <p id="login-error" class="form-error" role="alert" hidden></p>
+        <button class="btn btn-primary btn-block" type="submit" id="login-submit">Sign in</button>
+      </form>
+      <p class="login-foot">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        Audio is processed in memory and never stored.
+      </p>
+    </main>
+  </div>
+
+  <div id="setup-view" class="setup-view" hidden>
+    <main class="wizard-card">
+      <div class="brand brand-large">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round"><path d="M3 12h2M7 8v8M11 4v16M15 7v10M19 10v4M21 12h0"/></svg>
+        </span>
+        <span>Whisper Hub</span>
+      </div>
+      <p class="eyebrow">First-run setup</p>
+      <h1>Make this hub yours</h1>
+      <ol class="wizard-steps" id="wizard-steps" aria-label="Setup progress"></ol>
+      <div id="wizard-body"></div>
+      <p id="wizard-error" class="form-error" role="alert" hidden></p>
+    </main>
+  </div>
+
+  <div id="app-shell" hidden>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="#/overview" aria-label="Whisper Hub overview">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round"><path d="M3 12h2M7 8v8M11 4v16M15 7v10M19 10v4M21 12h0"/></svg>
+          </span>
+          <span>Whisper Hub</span>
+        </a>
+        <nav class="tabs" aria-label="Sections">
+          <a href="#/overview" data-tab="overview">Overview</a>
+          <a href="#/history" data-tab="history">History</a>
+          <a href="#/devices" data-tab="devices">Devices</a>
+          <a href="#/setup" data-tab="setup">Setup</a>
+          <a href="#/settings" data-tab="settings">Settings</a>
+        </nav>
+        <div class="topbar-actions">
+          <button class="model-chip" type="button" id="model-status" title="Model status">
+            <span class="model-dot" aria-hidden="true"></span>
+            <span class="model-status-text">—</span>
+          </button>
+          <button class="btn btn-primary record-trigger" type="button" id="record-button">
+            <span class="icon" data-icon="mic"></span><span class="record-label">Record</span>
+          </button>
+          <button class="icon-btn" type="button" id="theme-button" aria-label="Switch theme"
+                  title="Switch theme">
+            <span class="icon" data-icon="sun"></span>
+          </button>
+          <button class="icon-btn" type="button" id="logout-button" aria-label="Sign out" title="Sign out">
+            <span class="icon" data-icon="logout"></span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main id="main" class="main">
+      <section class="view" id="view-overview" data-view="overview">
+        <div class="view-head">
+          <div>
+            <p class="eyebrow">Overview</p>
+            <h1>Your voice, everywhere</h1>
+            <p class="sub">Every device shares one Whisper server and one English transcript history.</p>
+          </div>
+          <div class="head-actions">
+            <button class="btn btn-secondary" type="button" data-action="add-device">
+              <span class="icon" data-icon="plus"></span> Add device
+            </button>
+          </div>
+        </div>
+
+        <div class="stat-strip" id="stat-strip" aria-label="Summary"></div>
+
+        <div class="panel cta-panel" id="first-device-cta" hidden>
+          <div>
+            <p class="eyebrow">Next step</p>
+            <h2>Add your first device</h2>
+            <p class="muted">Create a device, then scan its QR code with the Whisper Hub pairing page.
+              Dictation from that device lands in this history.</p>
+          </div>
+          <button class="btn btn-primary" type="button" data-action="add-device">
+            <span class="icon" data-icon="plus"></span> Add your first device
+          </button>
+        </div>
+
+        <div class="section-head">
+          <h2>Devices</h2>
+          <a class="link" href="#/devices">Manage devices <span class="icon" data-icon="chevron-right"></span></a>
+        </div>
+        <div class="device-grid" id="device-grid"></div>
+
+        <div class="panel recent-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Recent</h2>
+              <p class="muted" id="recent-count"></p>
+            </div>
+            <a class="link" href="#/history">All history <span class="icon" data-icon="chevron-right"></span></a>
+          </div>
+          <div class="chips" id="recent-chips" role="tablist" aria-label="Filter recent transcriptions"></div>
+          <div class="timeline" id="recent-list"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-history" data-view="history" hidden>
+        <div class="view-head">
+          <div>
+            <p class="eyebrow">History</p>
+            <h1>Every transcript</h1>
+            <p class="sub">Search what you said, from any device. Translating a language? It is stored in English.</p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="history-toolbar">
+            <label class="search" for="history-search">
+              <span class="icon" data-icon="search"></span>
+              <input id="history-search" type="search" placeholder="Search transcripts…"
+                     autocomplete="off" spellcheck="false">
+              <button class="search-clear" type="button" id="history-clear" aria-label="Clear search" hidden>
+                <span class="icon" data-icon="x"></span>
+              </button>
+            </label>
+            <label class="select-wrap">
+              <span class="icon" data-icon="devices"></span>
+              <select id="history-device" aria-label="Filter by device"></select>
+            </label>
+          </div>
+          <p class="history-meta muted" id="history-meta"></p>
+          <div class="history-list" id="history-list"></div>
+          <div class="load-more-wrap">
+            <button class="btn btn-secondary" type="button" id="load-more" hidden>Load more</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-devices" data-view="devices" hidden>
+        <div class="view-head">
+          <div>
+            <p class="eyebrow">Devices</p>
+            <h1>Keys, pairing & access</h1>
+            <p class="sub">Each device has its own key. Revoke one without disturbing the others.</p>
+          </div>
+          <div class="head-actions">
+            <button class="btn btn-primary" type="button" data-action="add-device">
+              <span class="icon" data-icon="plus"></span> Add device
+            </button>
+          </div>
+        </div>
+        <div class="device-grid devices-grid" id="devices-grid"></div>
+      </section>
+
+      <section class="view" id="view-setup" data-view="setup" hidden>
+        <div class="view-head">
+          <div>
+            <p class="eyebrow">Setup</p>
+            <h1>Connect any OpenAI client</h1>
+            <p class="sub">Point existing dictation apps at this server. No plugin required.</p>
+          </div>
+        </div>
+        <div class="setup-grid">
+          <div class="panel">
+            <h2>Connection values</h2>
+            <p class="muted" id="setup-url-note">Use these in clients on your LAN.</p>
+            <div class="copy-row">
+              <label for="setup-api-base">Base URL — apps that append /audio/transcriptions</label>
+              <div class="copy-box">
+                <code id="setup-api-base">…</code>
+                <button class="icon-btn" type="button" data-copy-target="setup-api-base" aria-label="Copy base URL">
+                  <span class="icon" data-icon="copy"></span>
+                </button>
+              </div>
+            </div>
+            <div class="copy-row">
+              <label for="setup-endpoint">Full endpoint — apps that take a complete URL</label>
+              <div class="copy-box">
+                <code id="setup-endpoint">…</code>
+                <button class="icon-btn" type="button" data-copy-target="setup-endpoint" aria-label="Copy endpoint URL">
+                  <span class="icon" data-icon="copy"></span>
+                </button>
+              </div>
+            </div>
+            <div class="copy-row">
+              <label for="setup-model">Model name</label>
+              <div class="copy-box">
+                <code id="setup-model">whisper-1</code>
+                <button class="icon-btn" type="button" data-copy-target="setup-model" aria-label="Copy model name">
+                  <span class="icon" data-icon="copy"></span>
+                </button>
+              </div>
+            </div>
+            <div class="kv">
+              <div><span class="muted">Server engine</span><strong id="setup-server-model">—</strong></div>
+              <div><span class="muted">Auth</span><strong>Per-device API key</strong></div>
+            </div>
+          </div>
+          <div class="panel">
+            <h2>Endpoints</h2>
+            <ul class="endpoint-list" id="setup-endpoints"></ul>
+          </div>
+        </div>
+        <div class="setup-grid">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Try it with curl</h2>
+              <button class="btn btn-secondary btn-sm" type="button" id="copy-curl">
+                <span class="icon" data-icon="copy"></span> Copy
+              </button>
+            </div>
+            <pre class="code-block" id="setup-curl"></pre>
+          </div>
+          <div class="panel">
+            <div class="panel-head">
+              <h2>OpenAI Python SDK</h2>
+              <button class="btn btn-secondary btn-sm" type="button" id="copy-sdk">
+                <span class="icon" data-icon="copy"></span> Copy
+              </button>
+            </div>
+            <pre class="code-block" id="setup-sdk"></pre>
+          </div>
+        </div>
+        <div class="section-head"><h2>Client guides</h2></div>
+        <div class="guide-list" id="guide-list"></div>
+      </section>
+      <section class="view" id="view-settings" data-view="settings" hidden>
+        <div class="view-head">
+          <div>
+            <p class="eyebrow">Settings</p>
+            <h1>Models & server</h1>
+            <p class="sub">Changes save to this server. Fields set by an environment variable are read-only.</p>
+          </div>
+          <div class="head-actions">
+            <span class="model-badge" id="settings-model-badge">—</span>
+          </div>
+        </div>
+
+        <div class="settings-grid">
+          <form class="panel settings-panel" id="settings-form">
+            <div class="panel-head">
+              <h2>Model & inference</h2>
+            </div>
+            <div id="settings-fields"></div>
+            <div class="settings-save-row">
+              <button class="btn btn-primary" type="submit" id="settings-save">Save settings</button>
+              <span class="muted" id="settings-save-note"></span>
+            </div>
+          </form>
+
+          <div class="panel settings-panel">
+            <div class="panel-head">
+              <h2>Model status</h2>
+            </div>
+            <div class="model-status-card" id="model-status-card">
+              <div class="model-status-line"><span class="status-led" id="status-led"></span><strong id="status-title">—</strong></div>
+              <p class="muted" id="status-message"></p>
+              <div class="progress" id="status-progress-wrap" hidden><div class="progress-bar" id="status-progress"></div></div>
+              <dl class="detail-meta compact" id="status-meta"></dl>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-grid">
+          <div class="panel settings-panel">
+            <div class="panel-head"><h2>Security</h2></div>
+            <form id="password-form">
+              <div class="field">
+                <label for="current-password">Current password</label>
+                <input id="current-password" type="password" autocomplete="current-password" required>
+              </div>
+              <div class="field">
+                <label for="new-password">New password</label>
+                <input id="new-password" type="password" autocomplete="new-password" minlength="8" required>
+                <p class="field-note">At least 8 characters.</p>
+              </div>
+              <div class="field">
+                <label for="confirm-password">Confirm new password</label>
+                <input id="confirm-password" type="password" autocomplete="new-password" minlength="8" required>
+              </div>
+              <p class="form-error" id="password-error" role="alert" hidden></p>
+              <button class="btn btn-secondary" type="submit" id="password-save">Change password</button>
+              <p class="field-note" id="password-env-note" hidden>Set by <code>WHUB_ADMIN_PASSWORD</code>.</p>
+            </form>
+            <hr class="rule">
+            <h3>Sign out all sessions</h3>
+            <p class="muted">Rotates the session secret. Every browser and phone signed in to this dashboard must log in again.</p>
+            <button class="btn btn-secondary" type="button" id="logout-all">Sign out all sessions</button>
+          </div>
+
+          <div class="panel settings-panel">
+            <div class="panel-head"><h2>Data</h2></div>
+            <p class="muted">History is text only. Audio is never written to disk.</p>
+            <div class="data-actions">
+              <a class="btn btn-secondary" href="/api/admin/export?format=json" download>Export JSON</a>
+              <a class="btn btn-secondary" href="/api/admin/export?format=csv" download>Export CSV</a>
+            </div>
+            <hr class="rule">
+            <h3>Delete all history</h3>
+            <p class="muted">Removes every transcript from every device. Devices and keys stay linked.</p>
+            <button class="btn btn-danger" type="button" id="delete-history">Delete all history…</button>
+            <dl class="detail-meta compact" id="server-meta"></dl>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <footer class="foot">
+      <span>Whisper Hub</span>
+      <span class="foot-dot">·</span>
+      <span>Audio never leaves memory. History is text only.</span>
+    </footer>
+  </div>
+
+  <div class="overlay" id="entry-overlay" hidden>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="entry-title">
+      <header class="drawer-head">
+        <div>
+          <p class="eyebrow">Transcription</p>
+          <h2 id="entry-title">Entry</h2>
+        </div>
+        <button class="icon-btn" type="button" data-close="entry-overlay" aria-label="Close">
+          <span class="icon" data-icon="x"></span>
+        </button>
+      </header>
+      <div class="drawer-body" id="entry-body"></div>
+    </aside>
+  </div>
+
+  <div class="overlay" id="modal-root" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" id="modal-card">
+      <header class="modal-head">
+        <h2 id="modal-title">Dialog</h2>
+        <button class="icon-btn" type="button" data-close="modal-root" aria-label="Close">
+          <span class="icon" data-icon="x"></span>
+        </button>
+      </header>
+      <div class="modal-body" id="modal-body"></div>
+      <footer class="modal-foot" id="modal-foot"></footer>
+    </div>
+  </div>
+
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
