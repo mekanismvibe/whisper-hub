@@ -41,6 +41,19 @@ cloud, no audio files.
 
 ## Quick start
 
+### Prebuilt image (no clone)
+
+```bash
+# CPU
+docker run -d --name whisper-hub -p 8765:8765 -v whisper-hub-data:/data \
+  --tmpfs /tmp --restart unless-stopped ghcr.io/mekanismvibe/whisper-hub:latest
+# NVIDIA GPU (needs the NVIDIA Container Toolkit)
+docker run -d --name whisper-hub --gpus all -p 8765:8765 -v whisper-hub-data:/data \
+  --tmpfs /tmp --restart unless-stopped ghcr.io/mekanismvibe/whisper-hub:cuda
+
+docker exec whisper-hub cat /data/setup_token   # then open http://<server>:8765/setup?token=<token>
+```
+
 ### Docker (CPU)
 
 ```bash
