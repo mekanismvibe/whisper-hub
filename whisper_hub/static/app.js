@@ -122,7 +122,7 @@
     setup: null,
     recent: [],
     recentFilter: "all",
-    history: { items: [], cursor: null, q: "", deviceId: "", loading: false, loaded: false, seq: 0 },
+    history: { items: [], cursor: null, q: "", deviceId: "", loading: false, loaded: false, seq: 0, rendered: 0 },
     pair: null,
     record: null,
     refreshTimer: null,
@@ -225,16 +225,25 @@
     return Number.isNaN(date.getTime()) ? null : date;
   }
 
+  // One Intl formatter per shape, built once. Constructing a formatter inside
+  // toLocaleString per row is a measurable cost on long histories.
+  const ABS_TIME_FORMAT = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+  const CLOCK_FORMAT = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
+  const SHORT_DATE_FORMAT = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+  const SHORT_DATE_YEAR_FORMAT = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" });
+  const WEEKDAY_FORMAT = new Intl.DateTimeFormat(undefined, { weekday: "long" });
+  const LONG_DATE_FORMAT = new Intl.DateTimeFormat(undefined, { month: "long", day: "numeric", year: "numeric" });
+
   function absoluteTime(value) {
     const date = parseDate(value);
     if (!date) return value || "—";
-    return date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+    return ABS_TIME_FORMAT.format(date);
   }
 
   function clockTime(value) {
     const date = parseDate(value);
     if (!date) return "";
-    return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    return CLOCK_FORMAT.format(date);
   }
 
   function relativeTime(value) {
@@ -250,7 +259,8 @@
     const days = Math.round(hours / 24);
     if (days === 1) return "yesterday";
     if (days < 7) return `${days} days ago`;
-    return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
+    const format = date.getFullYear() === new Date().getFullYear() ? SHORT_DATE_FORMAT : SHORT_DATE_YEAR_FORMAT;
+    return format.format(date);
   }
 
   function dayKey(value) {
@@ -267,8 +277,8 @@
     const days = Math.round((startToday - startDay) / 86400000);
     if (days === 0) return "Today";
     if (days === 1) return "Yesterday";
-    if (days > 1 && days < 7) return date.toLocaleDateString(undefined, { weekday: "long" });
-    return date.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+    if (days > 1 && days < 7) return WEEKDAY_FORMAT.format(date);
+    return LONG_DATE_FORMAT.format(date);
   }
 
   let languageNames = null;
@@ -411,16 +421,13 @@
       return;
     }
     if (onSetupPath) history.replaceState(null, "", "/" + location.hash);
-    try {
-      const session = await fetch("/api/session", { credentials: "same-origin" }).then((response) => response.json());
-      if (session.authenticated) {
-        state.authenticated = true;
-        await enterApp();
-      } else {
-        showLogin();
-      }
-    } catch (error) {
-      showLogin("Could not reach the server. Check that it is running.");
+    // /api/setup/status already reports the session; asking /api/session again
+    // adds a second serial round trip to every dashboard load.
+    if (setup && setup.authenticated) {
+      state.authenticated = true;
+      await enterApp();
+    } else {
+      showLogin();
     }
   }
 
@@ -445,8 +452,10 @@
     $("#login-view").hidden = true;
     $("#app-shell").hidden = false;
     state.history.loaded = false;
-    showView(routeName(), { scroll: false });
-    refreshModelStatus();
+    await showView(routeName(), { scroll: false });
+    // Overview already fetched stats (which include model_status); only ask for
+    // the status separately when booting straight into another view.
+    syncModelStatusFromStats();
     if (!state.refreshTimer) {
       state.refreshTimer = setInterval(() => {
         if (!document.hidden) refreshLive();
@@ -487,7 +496,7 @@
     state.recent = [];
     state.settings = null;
     state.modelStatus = null;
-    state.history = { items: [], cursor: null, q: "", deviceId: "", loading: false, loaded: false, seq: 0 };
+    state.history = { items: [], cursor: null, q: "", deviceId: "", loading: false, loaded: false, seq: 0, rendered: 0 };
     if (state.modelTimer) {
       clearTimeout(state.modelTimer);
       state.modelTimer = null;
@@ -538,8 +547,9 @@
         }
       }
       syncDeviceSelect();
+      // The list DOM is kept while another view is shown; rebuilding it here
+      // made every return to History re-render the whole loaded list.
       if (!state.history.loaded) await loadHistory(true);
-      else renderHistory();
     }
     if (name === "setup") {
       await loadSetup();
@@ -560,7 +570,7 @@
 
   // Every Recent fetch takes a ticket; only the newest one for the current filter may paint.
   let recentSeq = 0;
-  const renderKeys = { recent: "", cards: "" };
+  const renderKeys = { recent: "", cards: "", stats: "", select: null };
 
   function recentQuery() {
     const query = new URLSearchParams({ limit: "20" });
@@ -577,7 +587,7 @@
   }
 
   function paintOverview({ force = false } = {}) {
-    renderStats();
+    renderStats(force);
     renderFirstDeviceCta();
     const cardsKey = JSON.stringify(state.devices);
     if (force || cardsKey !== renderKeys.cards) {
@@ -631,24 +641,28 @@
     if (!state.authenticated) return;
     const seq = ++recentSeq;
     const filter = state.recentFilter;
+    const onOverview = state.view === "overview";
     try {
+      // The Recent payload is only rendered on Overview. Fetching it on every
+      // other view cost ~11 KB per tick for data that was thrown away.
       const [stats, devices, recent] = await Promise.all([
         api("/api/admin/stats"),
         api("/api/admin/devices"),
-        api(`/api/admin/transcriptions?${recentQuery()}`),
+        onOverview ? api(`/api/admin/transcriptions?${recentQuery()}`) : Promise.resolve(null),
       ]);
       state.stats = stats;
       state.devices = devices.devices;
       syncDeviceSelect();
+      // /api/admin/stats already carries model_status; a second status request
+      // on every tick was redundant.
+      syncModelStatusFromStats();
       const staleFilter = recentFilterIsStale();
-      if (state.view === "overview") {
+      if (onOverview) {
         if (staleFilter) return loadOverview();
         if (seq === recentSeq && filter === state.recentFilter) state.recent = recent.items;
         paintOverview();
       }
       if (state.view === "devices") renderDeviceCards($("#devices-grid"), "devices");
-      if (state.view === "settings") renderModelStatusFromStats();
-      refreshModelStatus();
       if (state.pair) {
         const device = state.devices.find((item) => item.id === state.pair.deviceId);
         if (device && device.status === "active" && !state.pair.revealed) state.pair.linked = true;
@@ -693,10 +707,11 @@
     );
   }
 
-  function renderStats() {
+  function renderStats(force = false) {
     const strip = $("#stat-strip");
     const stats = state.stats;
     if (!stats) {
+      renderKeys.stats = "";
       replace(
         strip,
         ...Array.from({ length: 4 }, () =>
@@ -706,6 +721,25 @@
       return;
     }
     const modelShort = String(stats.model || "—");
+    const lastValue = stats.last_transcription_at ? relativeTime(stats.last_transcription_at) : "—";
+    const lastSub = stats.last_transcription_at ? absoluteTime(stats.last_transcription_at) : "No transcriptions yet";
+    // The 10 s tick usually returns identical numbers; rebuilding the tiles
+    // replaced 24 nodes and forced a layout for nothing. The relative label is
+    // part of the key so "just now" still ages on its own.
+    const statsKey = JSON.stringify([
+      stats.transcriptions_total,
+      stats.transcriptions_today,
+      stats.devices_active,
+      stats.devices_pending,
+      stats.devices_total,
+      modelShort,
+      Boolean(stats.models_loaded),
+      stats.device,
+      lastValue,
+      lastSub,
+    ]);
+    if (!force && statsKey === renderKeys.stats) return;
+    renderKeys.stats = statsKey;
     strip.replaceChildren(
       statTile({
         iconName: "headphones",
@@ -728,9 +762,9 @@
       }),
       statTile({
         iconName: "clock",
-        value: stats.last_transcription_at ? relativeTime(stats.last_transcription_at) : "—",
+        value: lastValue,
         label: "Last activity",
-        sub: stats.last_transcription_at ? absoluteTime(stats.last_transcription_at) : "No transcriptions yet",
+        sub: lastSub,
       })
     );
   }
@@ -1016,6 +1050,14 @@
     const select = $("#history-device");
     if (!select) return;
     const current = state.history.deviceId;
+    // Rebuilding the <select> every 10 s closed an open dropdown and replaced
+    // its options plus the visible value even when the device list was unchanged.
+    const selectKey = current + "|" + state.devices.map((device) => `${device.id}:${device.display_name}`).join("|");
+    if (selectKey === renderKeys.select) {
+      select.value = current;
+      return;
+    }
+    renderKeys.select = selectKey;
     const options = [new Option("All devices", "")];
     for (const device of state.devices) options.push(new Option(device.display_name, String(device.id)));
     select.replaceChildren(...options);
@@ -1024,6 +1066,7 @@
       // The filtered device is gone: show all devices, and reload so the list matches.
       select.value = "";
       state.history.deviceId = "";
+      renderKeys.select = null;
       if (state.view === "history") loadHistory(true);
     }
   }
@@ -1045,10 +1088,11 @@
     try {
       const payload = await api(`/api/admin/transcriptions?${query}`);
       if (seq !== history.seq) return;
+      const beforeCount = history.items.length;
       history.items = reset ? payload.items : history.items.concat(payload.items);
       history.cursor = payload.next_cursor;
       history.loaded = true;
-      renderHistory();
+      renderHistory({ append: !reset && beforeCount > 0 });
     } catch (error) {
       if (seq === history.seq && error.status !== 401) toast(error.message, "error");
     } finally {
@@ -1059,7 +1103,7 @@
     }
   }
 
-  function renderHistory() {
+  function renderHistory({ append = false } = {}) {
     const list = $("#history-list");
     const meta = $("#history-meta");
     const loadMore = $("#load-more");
@@ -1092,11 +1136,18 @@
             : null,
         })
       );
+      history.rendered = 0;
       loadMore.hidden = true;
       return;
     }
 
     meta.textContent = `${history.items.length} transcript${history.items.length === 1 ? "" : "s"}${filters.length ? " · " + filters.join(" · ") : ""}`;
+    if (append && history.rendered > 0 && list.childElementCount) {
+      appendHistoryItems(list, history.items.slice(history.rendered));
+      history.rendered = history.items.length;
+      loadMore.hidden = !history.cursor;
+      return;
+    }
     const groups = new Map();
     for (const item of history.items) {
       const key = dayKey(item.created_at);
@@ -1107,7 +1158,7 @@
       ...Array.from(groups.entries()).map(([key, items]) =>
         h(
           "section",
-          { class: "day-group", dataset: { day: key } },
+          { class: "day-group", dataset: { day: key, count: String(items.length) } },
           h(
             "h3",
             { class: "day-head" },
@@ -1118,7 +1169,37 @@
         )
       )
     );
+    history.rendered = history.items.length;
     loadMore.hidden = !history.cursor;
+  }
+
+  // Load more only ever appends older entries, so keep the existing rows and
+  // update the last day group instead of rebuilding the whole list.
+  function appendHistoryItems(list, items) {
+    let group = list.lastElementChild;
+    let pending = [];
+    const flush = () => {
+      if (!pending.length) return;
+      const total = Number(group.dataset.count || 0) + pending.length;
+      group.dataset.count = String(total);
+      group.append(...pending);
+      group.querySelector(".day-count").textContent = `${total} note${total === 1 ? "" : "s"}`;
+      pending = [];
+    };
+    for (const item of items) {
+      const key = dayKey(item.created_at);
+      if (!group || group.dataset.day !== key) {
+        flush();
+        group = h(
+          "section",
+          { class: "day-group", dataset: { day: key, count: "0" } },
+          h("h3", { class: "day-head" }, h("span", { text: dayLabel(item.created_at) }), h("span", { class: "day-count" }))
+        );
+        list.append(group);
+      }
+      pending.push(entryRow(item, { grouped: true }));
+    }
+    flush();
   }
 
   /* ---------------------------------------------------------------- entry detail */
@@ -1131,6 +1212,16 @@
     overlay.hidden = false;
     lockScroll();
     $("#entry-title").textContent = `Entry #${id}`;
+    const known =
+      state.history.items.find((item) => String(item.id) === String(id)) ||
+      state.recent.find((item) => String(item.id) === String(id));
+    if (known) {
+      // The list already holds every field the drawer shows; opening it should
+      // not wait for another round trip.
+      renderEntry(known);
+      setTimeout(() => $(".drawer-head .icon-btn").focus({ preventScroll: true }), 30);
+      return;
+    }
     replace($("#entry-body"), h("div", { class: "skeleton", style: "height:120px;margin-bottom:18px" }), h("div", { class: "skeleton", style: "height:220px" }));
     setTimeout(() => $(".drawer-head .icon-btn").focus({ preventScroll: true }), 30);
     try {
@@ -2263,6 +2354,7 @@
         { name: "device", label: "Device", type: "select", options: ["auto", "cpu", "cuda"] },
         { name: "compute_type", label: "Compute type", type: "select", options: ["auto", "int8", "int8_float16", "int8_float32", "float16", "float32"] },
         { name: "beam_size", label: "Beam size", type: "number", min: 1, max: 10 },
+        { name: "translate_beam_size", label: "Translation beam size", type: "number", min: 1, max: 10, note: "Used only when translating non-English audio." },
         { name: "cpu_threads", label: "CPU threads (0 = auto)", type: "number", min: 0 },
         { name: "max_concurrency", label: "Max concurrent requests", type: "number", min: 1, max: 32 },
         { name: "model_idle_unload_seconds", label: "Idle unload (seconds, 0 = never)", type: "number", min: 0, step: 1 },
@@ -2421,7 +2513,7 @@
       if (input.disabled) return;
       const field = input.dataset.setting;
       if (input.type === "checkbox") payload[field] = input.checked;
-      else if (["beam_size", "cpu_threads", "max_concurrency", "max_upload_mb", "model_idle_unload_seconds", "lang_confidence"].includes(field)) {
+      else if (["beam_size", "translate_beam_size", "cpu_threads", "max_concurrency", "max_upload_mb", "model_idle_unload_seconds", "lang_confidence"].includes(field)) {
         // An emptied number box means "leave unchanged", not 0 (0 disables some features).
         if (input.value.trim() !== "") payload[field] = Number(input.value);
       }
@@ -2491,6 +2583,13 @@
 
   function renderModelStatusFromStats() {
     if (state.stats && state.stats.model_status) renderModelStatus(state.stats.model_status);
+  }
+
+  function syncModelStatusFromStats() {
+    // The stats payload carries model_status; only older backends need the
+    // dedicated endpoint.
+    if (state.stats && state.stats.model_status) renderModelStatusFromStats();
+    else refreshModelStatus();
   }
 
   async function refreshModelStatus() {
@@ -2629,7 +2728,7 @@
       state.history.q = value;
       $("#history-clear").hidden = !event.target.value;
       clearTimeout(state.searchTimer);
-      state.searchTimer = setTimeout(() => loadHistory(true), 300);
+      state.searchTimer = setTimeout(() => loadHistory(true), 200);
     });
     $("#history-clear").addEventListener("click", () => {
       $("#history-search").value = "";

@@ -83,6 +83,7 @@ class Config:
     compute_type: str = "auto"
     cpu_threads: int = 0
     beam_size: int = 5
+    translate_beam_size: int = 5
     max_concurrency: int = 1
     max_upload_mb: int = 100
     model_idle_unload_seconds: float = 0.0
@@ -101,6 +102,8 @@ class Config:
             raise ValueError("WHUB_MAX_UPLOAD_MB must be at least 1")
         if self.beam_size < 1:
             raise ValueError("WHUB_BEAM_SIZE must be at least 1")
+        if self.translate_beam_size < 1:
+            raise ValueError("WHUB_TRANSLATE_BEAM_SIZE must be at least 1")
         if self.max_concurrency < 1:
             raise ValueError("WHUB_MAX_CONCURRENCY must be at least 1")
         if self.device not in {"auto", "cpu", "cuda"}:
@@ -154,6 +157,9 @@ class Config:
             compute_type=(get("COMPUTE_TYPE") or "auto").strip().lower(),
             cpu_threads=_parse_int(get("CPU_THREADS"), 0, "WHUB_CPU_THREADS"),
             beam_size=_parse_int(get("BEAM_SIZE"), 5, "WHUB_BEAM_SIZE"),
+            translate_beam_size=_parse_int(
+                get("TRANSLATE_BEAM_SIZE"), 5, "WHUB_TRANSLATE_BEAM_SIZE"
+            ),
             max_concurrency=_parse_int(get("MAX_CONCURRENCY"), 1, "WHUB_MAX_CONCURRENCY"),
             max_upload_mb=_parse_int(get("MAX_UPLOAD_MB"), 100, "WHUB_MAX_UPLOAD_MB"),
             model_idle_unload_seconds=_parse_float(

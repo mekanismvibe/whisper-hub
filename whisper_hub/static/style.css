@@ -909,6 +909,10 @@ button {
   border-radius: 12px;
   cursor: pointer;
   transition: background 0.14s ease;
+  /* Off-screen rows in a 2,000-entry history would otherwise be restyled and
+     laid out on every append (measured ~90 ms per 50-row Load more). */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 54px;
 }
 
 .entry:hover {

@@ -54,9 +54,21 @@ class FakeEngine:
         self.queue.append(result)
 
     def transcribe_bytes(
-        self, data: bytes, *, prompt: str | None = None, language: str | None = None
+        self,
+        data: bytes,
+        *,
+        prompt: str | None = None,
+        language: str | None = None,
+        without_timestamps: bool = False,
     ) -> TranscriptionResult:
-        self.calls.append({"size": len(data), "prompt": prompt, "language": language})
+        self.calls.append(
+            {
+                "size": len(data),
+                "prompt": prompt,
+                "language": language,
+                "without_timestamps": without_timestamps,
+            }
+        )
         if self.queue:
             item = self.queue.popleft()
             if isinstance(item, BaseException):

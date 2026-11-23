@@ -231,6 +231,7 @@ port and data directory are environment/CLI only.
 | `WHUB_COMPUTE_TYPE` | `auto` | e.g. `int8`, `int8_float16`, `float16` |
 | `WHUB_CPU_THREADS` | `0` | 0 = library default |
 | `WHUB_BEAM_SIZE` | `5` | Decoding beam size |
+| `WHUB_TRANSLATE_BEAM_SIZE` | `5` | Decoding beam size for translations |
 | `WHUB_MAX_CONCURRENCY` | `1` | Concurrent inference requests |
 | `WHUB_MODEL_IDLE_UNLOAD_SECONDS` | `0` | Unload after idle; 0 = never |
 | `WHUB_MAX_UPLOAD_MB` | `100` | Upload limit |

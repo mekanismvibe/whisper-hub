@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -26,6 +27,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartParser
+from starlette.middleware.gzip import GZipMiddleware
 
 from . import __version__, catalog, cuda, hardware
 from .auth import (
@@ -55,6 +57,16 @@ from .settings import ENGINE_RELOAD_FIELDS, EnvLockedError, SettingsError, Setti
 logger = logging.getLogger("whisper_hub")
 
 STATIC_DIR = Path(__file__).parent / "static"
+# Content hashes in the asset URLs let the browser keep app.js/style.css without a
+# revalidation round trip. They are computed on restart; a deploy restarts the app.
+ASSET_VERSIONS = {
+    f"/static/{name}": hashlib.sha256((STATIC_DIR / name).read_bytes()).hexdigest()[:12]
+    for name in ("app.js", "style.css")
+}
+INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8").replace(
+    "__APP_VERSION__", ASSET_VERSIONS["/static/app.js"]
+).replace("__STYLE_VERSION__", ASSET_VERSIONS["/static/style.css"])
+INDEX_ETAG = '"' + hashlib.sha256(INDEX_HTML.encode("utf-8")).hexdigest()[:32] + '"'
 PAIRING_TTL = timedelta(minutes=15)
 
 
@@ -259,7 +271,12 @@ async def _admission(request: Request):
 
 
 async def _transcribe(
-    request: Request, data: bytes, *, prompt: str | None, language: str | None
+    request: Request,
+    data: bytes,
+    *,
+    prompt: str | None,
+    language: str | None,
+    without_timestamps: bool = False,
 ) -> tuple[TranscriptionResult, int]:
     started = time.perf_counter()
     try:
@@ -272,6 +289,7 @@ async def _transcribe(
                 data,
                 prompt=prompt,
                 language=language,
+                without_timestamps=without_timestamps,
             )
     except ApiError:
         raise
@@ -634,6 +652,10 @@ def create_app(
         BodyLimitMiddleware,
         get_limits=lambda: (app.state.config.max_upload_bytes, app.state.config.max_upload_mb),
     )
+    # The dashboard ships ~155 KB of uncompressed CSS/JS and re-fetches API
+    # payloads every 10 s; gzip cuts both by roughly 4x. Small JSON stays identity
+    # encoded.
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
     @app.middleware("http")
     async def same_origin_only(request: Request, call_next):
@@ -668,7 +690,11 @@ def create_app(
         response.headers.setdefault("X-Frame-Options", "DENY")
         path = request.url.path
         if path.startswith("/static/"):
-            response.headers["Cache-Control"] = "no-cache"
+            version = ASSET_VERSIONS.get(path)
+            if version is not None and request.query_params.get("v") == version:
+                response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            else:
+                response.headers["Cache-Control"] = "no-cache"
         elif path.startswith(("/api/", "/v1/", "/healthz")):
             response.headers.setdefault("Cache-Control", "no-store")
         return response
@@ -769,6 +795,9 @@ def create_app(
             data,
             prompt=fields.get("prompt"),
             language=_normalize_language(fields.get("language")),
+            # Only plain text/JSON responses can drop timestamp tokens; subtitles and
+            # verbose_json need segment times.
+            without_timestamps=response_format in {"text", "json"},
         )
         row = _store(request, device["id"], result, processing_ms, endpoint)
         return _audio_response(result, response_format, row, endpoint)
@@ -1240,6 +1269,7 @@ def create_app(
             active.config = replace(
                 active.config,
                 beam_size=new_config.beam_size,
+                translate_beam_size=new_config.translate_beam_size,
                 lang_confidence=new_config.lang_confidence,
                 honor_client_language=new_config.honor_client_language,
             )
@@ -1405,21 +1435,25 @@ def create_app(
 
     # ---------------------------------------------------------------- dashboard SPA
 
-    @app.get("/", include_in_schema=False)
-    async def index() -> FileResponse:
-        return FileResponse(
-            STATIC_DIR / "index.html",
-            media_type="text/html",
-            headers={"Cache-Control": "no-cache"},
+    def _dashboard_html(request: Request) -> Response:
+        # Same HTML every request (only the asset versions differ per release), so
+        # keep the ETag and still answer conditional GETs with a 304.
+        etag = request.headers.get("if-none-match") or ""
+        if INDEX_ETAG in {value.strip() for value in etag.split(",")}:
+            return Response(
+                status_code=304, headers={"Cache-Control": "no-cache", "ETag": INDEX_ETAG}
+            )
+        return HTMLResponse(
+            INDEX_HTML, headers={"Cache-Control": "no-cache", "ETag": INDEX_ETAG}
         )
 
+    @app.get("/", include_in_schema=False)
+    async def index(request: Request) -> Response:
+        return _dashboard_html(request)
+
     @app.get("/setup", include_in_schema=False)
-    async def setup_page() -> FileResponse:
-        return FileResponse(
-            STATIC_DIR / "index.html",
-            media_type="text/html",
-            headers={"Cache-Control": "no-cache"},
-        )
+    async def setup_page(request: Request) -> Response:
+        return _dashboard_html(request)
 
     @app.get("/favicon.svg", include_in_schema=False)
     async def favicon() -> FileResponse:

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from whisper_hub.config import Config
-from whisper_hub.engine import ParakeetModels, run_policy
+from whisper_hub.engine import ParakeetModels, _warmup_parakeet, _warmup_whisper, run_policy
 
 
 class FakeWhisperModel:
@@ -155,7 +155,7 @@ def test_non_english_audio_drops_transcription_and_runs_translation():
     assert translator.consumed == 1
     assert translator.calls[0]["task"] == "translate"
     assert translator.calls[0]["language"] == "es"
-    assert translator.calls[0]["beam_size"] == 3
+    assert translator.calls[0]["beam_size"] == 5
 
 
 def test_language_hint_is_used_only_when_enabled():
@@ -349,6 +349,107 @@ def test_parakeet_error_falls_back_to_whisper(caplog):
     assert primary.calls[0]["language"] == "en"
     assert "parakeet failed" in caplog.text
     assert "boom" not in caplog.text, "the warning must not include arbitrary text"
+
+
+def test_translation_uses_its_own_beam_size():
+    primary = FakeWhisperModel("es", "transcripción original")
+    translator = FakeWhisperModel("es", "the translated english text")
+    source = FakeModelSource(primary, translator)
+
+    result = run_policy(
+        source,
+        b"audio",
+        prompt=None,
+        language_hint=None,
+        beam_size=5,
+        translate_beam_size=2,
+        honor_client_language=False,
+    )
+
+    assert result.task == "translate"
+    assert primary.calls[0]["beam_size"] == 5  # the scan still uses beam_size
+    assert translator.calls[0]["beam_size"] == 2
+
+
+def test_without_timestamps_reaches_whisper_transcribe_and_translate():
+    primary = FakeWhisperModel("en", "hello")
+    source = FakeModelSource(primary)
+    run_policy(
+        source,
+        b"audio",
+        prompt=None,
+        language_hint=None,
+        beam_size=5,
+        honor_client_language=False,
+        without_timestamps=True,
+    )
+    assert source.requests == [False]
+    assert primary.calls[0]["without_timestamps"] is True
+
+    translate_primary = FakeWhisperModel("es", "texto original")
+    translator = FakeWhisperModel("es", "hello")
+    run_policy(
+        FakeModelSource(translate_primary, translator),
+        b"audio",
+        prompt=None,
+        language_hint=None,
+        beam_size=5,
+        honor_client_language=False,
+        without_timestamps=True,
+    )
+    assert translator.calls[0]["without_timestamps"] is True
+
+
+def test_without_timestamps_does_not_touch_parakeet():
+    primary = FakeWhisperModel("en", "SHOULD NOT APPEAR")
+    speech = FakeSpeechSource(FakeSpeechModel("hello from parakeet"))
+
+    result = run_policy(
+        FakeModelSource(primary),
+        AUDIO,
+        prompt=None,
+        language_hint=None,
+        beam_size=5,
+        honor_client_language=False,
+        speech=speech,
+        without_timestamps=True,
+    )
+
+    assert result.text == "hello from parakeet"
+    assert "without_timestamps" not in speech.model.calls[0]
+
+
+def test_warmup_whisper_detects_and_decodes_silence():
+    model = FakeWhisperModel("en", "")
+
+    _warmup_whisper(model)
+
+    assert model.detect_calls == [{"vad_filter": False}]
+    assert len(model.calls) == 1
+    assert model.calls[0]["beam_size"] == 1
+    assert model.consumed == 1, "the lazy segment generator must be consumed"
+
+
+def test_warmup_whisper_failure_is_logged_not_raised(caplog):
+    class Broken(FakeWhisperModel):
+        def detect_language(self, audio, **kwargs):
+            raise RuntimeError("boom")
+
+    _warmup_whisper(Broken("en", "text"))
+
+    assert "whisper warm-up failed" in caplog.text
+    assert "boom" not in caplog.text
+
+
+def test_warmup_parakeet_runs_thirty_seconds_of_silence():
+    speech = FakeSpeechModel()
+
+    _warmup_parakeet(speech)
+
+    call = speech.calls[0]
+    assert call["timestamps"] == "none"
+    assert call["sample_rate"] == 16000
+    assert len(call["audio"]) == 16000 * 30
 
 
 def test_parakeet_models_load_lazily_and_unload(monkeypatch):

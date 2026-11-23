@@ -46,6 +46,21 @@ def test_every_response_format(admin: TestClient, endpoint: str, response_format
         assert "00:00:00.000 --> 00:00:01.500" in response.text
 
 
+@pytest.mark.parametrize(
+    ("response_format", "skip_timestamps"),
+    [("text", True), ("json", True), ("verbose_json", False), ("srt", False), ("vtt", False)],
+)
+@pytest.mark.parametrize("endpoint", ["transcriptions", "translations"])
+def test_timestamp_tokens_are_skipped_only_for_plain_formats(
+    admin: TestClient, endpoint: str, response_format: str, skip_timestamps: bool
+):
+    _, key, _ = create_and_pair(admin)
+    engine: FakeEngine = admin.app.state.engine
+    response = post_audio(admin, key, endpoint, {"response_format": response_format})
+    assert response.status_code == 200, response.text
+    assert engine.calls[-1]["without_timestamps"] is skip_timestamps
+
+
 def test_apple_shortcuts_default_to_plain_text(admin: TestClient):
     _, key, _ = create_and_pair(admin)
     shortcut = {**auth(key), "User-Agent": "BackgroundShortcutRunner/5114.0.8.3 CFNetwork/3896 Darwin/27.2.0"}

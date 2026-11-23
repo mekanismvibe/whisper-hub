@@ -51,20 +51,34 @@ def test_settings_api_shows_and_edits_values(admin: TestClient):
     body = admin.get("/api/admin/settings").json()
     assert body["values"]["model"] == "fake-model"
     assert body["values"]["beam_size"] == 5
+    assert body["values"]["translate_beam_size"] == 5
     assert body["catalog"]
     assert isinstance(body["locked"], dict)
     assert body["server"]["version"]
 
     response = admin.post(
         "/api/admin/settings",
-        json={"beam_size": 3, "max_concurrency": 2, "honor_client_language": True},
+        json={
+            "beam_size": 3,
+            "translate_beam_size": 2,
+            "max_concurrency": 2,
+            "honor_client_language": True,
+        },
     )
     assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["values"]["beam_size"] == 3
+    assert payload["values"]["translate_beam_size"] == 2
     assert payload["values"]["honor_client_language"] is True
     assert payload["reload_requested"] is False
     assert admin.app.state.config.beam_size == 3
+    assert admin.app.state.config.translate_beam_size == 2
+
+
+def test_settings_api_rejects_out_of_range_translate_beam_size(admin: TestClient):
+    response = admin.post("/api/admin/settings", json={"translate_beam_size": 11})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_setting"
 
 
 def test_settings_api_rejects_a_translation_capable_main_without_translator(client_factory):

@@ -157,9 +157,9 @@ def test_per_request_settings_reach_the_running_engine(client_factory):
     from .conftest import ADMIN_PASSWORD
 
     client.post("/api/login", json={"password": ADMIN_PASSWORD})
-    saved = client.post("/api/admin/settings", json={"beam_size": 2, "lang_confidence": 0.8, "honor_client_language": True})
+    saved = client.post("/api/admin/settings", json={"beam_size": 2, "translate_beam_size": 4, "lang_confidence": 0.8, "honor_client_language": True})
     assert saved.status_code == 200 and saved.json()["reload_requested"] is False
-    assert (fake.config.beam_size, fake.config.lang_confidence, fake.config.honor_client_language) == (2, 0.8, True)
+    assert (fake.config.beam_size, fake.config.translate_beam_size, fake.config.lang_confidence, fake.config.honor_client_language) == (2, 4, 0.8, True)
 
 
 def test_blank_env_vars_do_not_lock_settings():
@@ -167,6 +167,14 @@ def test_blank_env_vars_do_not_lock_settings():
 
     config = _Config.from_env({"WHUB_MODEL": "", "WHUB_PUBLIC_URL": " ", "WHUB_BEAM_SIZE": "3"})
     assert config.env_names == frozenset({"WHUB_BEAM_SIZE"})
+
+
+def test_translate_beam_size_env():
+    from whisper_hub.config import Config as _Config
+
+    config = _Config.from_env({"WHUB_TRANSLATE_BEAM_SIZE": "2"})
+    assert config.translate_beam_size == 2
+    assert "WHUB_TRANSLATE_BEAM_SIZE" in config.env_names
 
 
 def test_dotenv_quoted_value_with_inline_comment(tmp_path):

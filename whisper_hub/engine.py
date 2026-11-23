@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Protocol
 
+import numpy as np
+
 from .config import Config
 from .errors import DecodeError, EngineBusyError
 
@@ -113,6 +115,59 @@ def _is_multilingual(model: Any) -> bool:
     return bool(getattr(getattr(model, "model", None), "is_multilingual", True))
 
 
+def _decode_audio(data: bytes) -> np.ndarray:
+    """Decode any audio container to 16 kHz mono float32, entirely in memory.
+
+    Mirrors ``faster_whisper.audio.decode_audio`` (same s16 mono resampler and
+    500k-sample FIFO grouping, so the samples are bit-identical) but collects the
+    resampled int16 chunks directly. That skips upstream's BytesIO copy, its second
+    float32 allocation and its trailing ``gc.collect()``, which costs tens of
+    milliseconds once torch and the models are loaded.
+    """
+    import av
+
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16", layout="mono", rate=16000
+    )
+    chunks: list[np.ndarray] = []
+
+    def valid_frames(frames: Any) -> Any:
+        iterator = iter(frames)
+        while True:
+            try:
+                yield next(iterator)
+            except StopIteration:
+                break
+            except av.error.InvalidDataError:
+                continue
+
+    def grouped(frames: Any, num_samples: int = 500_000) -> Any:
+        fifo = av.audio.fifo.AudioFifo()
+        for frame in frames:
+            frame.pts = None  # Ignore timestamp checks, like upstream.
+            fifo.write(frame)
+            if fifo.samples >= num_samples:
+                yield fifo.read()
+        if fifo.samples > 0:
+            yield fifo.read()
+
+    with av.open(BytesIO(data), mode="r", metadata_errors="ignore") as container:
+        for frame in grouped(valid_frames(container.decode(audio=0))):
+            chunks.extend(
+                resampled.to_ndarray().reshape(-1)
+                for resampled in resampler.resample(frame)
+            )
+        # Flush the resampler so the tail samples are not dropped.
+        chunks.extend(
+            resampled.to_ndarray().reshape(-1)
+            for resampled in resampler.resample(None)
+        )
+    samples = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int16)
+    audio = samples.astype(np.float32)
+    audio /= 32768.0
+    return audio
+
+
 def _detector(models: ModelSource) -> Any | None:
     """The model whose language head decides routing; None when no model can detect."""
     model, _ = models.get_model(translate=False)
@@ -132,11 +187,15 @@ def run_policy(
     honor_client_language: bool,
     lang_confidence: float = 0.5,
     speech: SpeechSource | None = None,
+    translate_beam_size: int = 5,
+    without_timestamps: bool = False,
 ) -> TranscriptionResult:
     """Detect the language, then transcribe English or translate everything else.
 
     With ``speech`` (Parakeet), English is detected once with Whisper's language head
     and transcribed by ``speech``; Whisper is only asked for text when that fails.
+    ``without_timestamps`` drops timestamp tokens from Whisper output; callers may only
+    set it when the response does not need segment times.
     """
     if speech is not None:
         return _run_hybrid_policy(
@@ -146,8 +205,10 @@ def run_policy(
             prompt=prompt,
             language_hint=language_hint,
             beam_size=beam_size,
+            translate_beam_size=translate_beam_size,
             honor_client_language=honor_client_language,
             lang_confidence=lang_confidence,
+            without_timestamps=without_timestamps,
         )
     model, model_name = models.get_model(translate=False)
     language = language_hint if honor_client_language else None
@@ -161,16 +222,21 @@ def run_policy(
             if detected_hint != "en":
                 return _translate_only(
                     models, audio, detected=detected_hint, language_probability=probability,
-                    prompt=prompt, beam_size=beam_size,
+                    prompt=prompt, translate_beam_size=translate_beam_size,
+                    without_timestamps=without_timestamps,
                 )
             language = "en"
     common: dict[str, Any] = {
         "vad_filter": True,
-        "beam_size": beam_size,
         "condition_on_previous_text": False,
         "initial_prompt": prompt or None,
+        "without_timestamps": without_timestamps,
     }
-    segments, info = model.transcribe(audio, task="transcribe", language=language, **common)
+    transcribe_options = {**common, "beam_size": beam_size}
+    translate_options = {**common, "beam_size": translate_beam_size}
+    segments, info = model.transcribe(
+        audio, task="transcribe", language=language, **transcribe_options
+    )
     detected = (getattr(info, "language", None) or "en").lower()
     language_probability = getattr(info, "language_probability", None)
     treat_as_english = _low_confidence_english(
@@ -188,7 +254,9 @@ def run_policy(
         # A short English clip misdetected as another language: decode it as English
         # instead of sending it through the translate task (which may mangle it).
         del segments
-        segments, english_info = model.transcribe(audio, task="transcribe", language="en", **common)
+        segments, english_info = model.transcribe(
+            audio, task="transcribe", language="en", **transcribe_options
+        )
         consumed = list(segments)
         active_info = english_info
         active_model = model_name
@@ -197,7 +265,7 @@ def run_policy(
         del segments
         translator, translator_name = models.get_model(translate=True)
         segments, translated_info = translator.transcribe(
-            audio, task="translate", language=detected, **common
+            audio, task="translate", language=detected, **translate_options
         )
         consumed = list(segments)
         active_info = translated_info
@@ -223,12 +291,14 @@ def _translate_only(
     detected: str,
     language_probability: float | None,
     prompt: str | None,
-    beam_size: int,
+    translate_beam_size: int,
+    without_timestamps: bool,
 ) -> TranscriptionResult:
     translator, translator_name = models.get_model(translate=True)
     segments, info = translator.transcribe(
-        audio, task="translate", language=detected, vad_filter=True, beam_size=beam_size,
-        condition_on_previous_text=False, initial_prompt=prompt or None,
+        audio, task="translate", language=detected, vad_filter=True,
+        beam_size=translate_beam_size, condition_on_previous_text=False,
+        initial_prompt=prompt or None, without_timestamps=without_timestamps,
     )
     consumed = list(segments)
     return TranscriptionResult(
@@ -257,16 +327,20 @@ def _run_hybrid_policy(
     prompt: str | None,
     language_hint: str | None,
     beam_size: int,
+    translate_beam_size: int,
     honor_client_language: bool,
     lang_confidence: float,
+    without_timestamps: bool,
 ) -> TranscriptionResult:
     """Whisper detects (and translates), Parakeet transcribes English without decoding it twice."""
     common: dict[str, Any] = {
         "vad_filter": True,
-        "beam_size": beam_size,
         "condition_on_previous_text": False,
         "initial_prompt": prompt or None,
+        "without_timestamps": without_timestamps,
     }
+    transcribe_options = {**common, "beam_size": beam_size}
+    translate_options = {**common, "beam_size": translate_beam_size}
     model, model_name = models.get_model(translate=False)
     if language_hint and honor_client_language:
         detected = language_hint.lower()
@@ -311,7 +385,9 @@ def _run_hybrid_policy(
                 "parakeet failed (%s); falling back to whisper for this request",
                 type(exc).__name__,
             )
-        segments, info = model.transcribe(audio, task="transcribe", language="en", **common)
+        segments, info = model.transcribe(
+            audio, task="transcribe", language="en", **transcribe_options
+        )
         consumed = list(segments)
         text = "".join(getattr(segment, "text", "") for segment in consumed).strip()
         return TranscriptionResult(
@@ -325,7 +401,9 @@ def _run_hybrid_policy(
         )
 
     translator, translator_name = models.get_model(translate=True)
-    segments, info = translator.transcribe(audio, task="translate", language=detected, **common)
+    segments, info = translator.transcribe(
+        audio, task="translate", language=detected, **translate_options
+    )
     consumed = list(segments)
     text = "".join(getattr(segment, "text", "") for segment in consumed).strip()
     return TranscriptionResult(
@@ -362,6 +440,33 @@ def _cuda_runtime_available() -> bool:
         except OSError:
             return False
     return True
+
+
+def _warmup_whisper(model: Any) -> None:
+    """Run one silent decode so the first real request does not pay the kernel warm-up."""
+    try:
+        silence = np.zeros(16000 * 30, dtype=np.float32)
+        if _is_multilingual(model):
+            model.detect_language(silence, vad_filter=False)
+        # dictation is short: one second exercises the tokenizer/decoder too.
+        segments, _ = model.transcribe(silence[:16000], beam_size=1)
+        list(segments)
+    except Exception as exc:
+        logger.warning(
+            "whisper warm-up failed (%s); the first request may be slower",
+            type(exc).__name__,
+        )
+
+
+def _warmup_parakeet(model: Any) -> None:
+    try:
+        silence = np.zeros(16000 * 30, dtype=np.float32)
+        model.transcribe(audio=silence, sample_rate=16000, timestamps="none")
+    except Exception as exc:
+        logger.warning(
+            "parakeet warm-up failed (%s); the first request may be slower",
+            type(exc).__name__,
+        )
 
 
 class WhisperModels:
@@ -435,6 +540,7 @@ class WhisperModels:
             compute_type=self._compute_type,
             cpu_threads=self.config.cpu_threads,
         )
+        _warmup_whisper(model)
         logger.info("loaded whisper model=%s in %.1fs", name, time.monotonic() - started)
         return model
 
@@ -508,15 +614,22 @@ class ParakeetModels:
 
     def _load(self) -> SpeechModel:
         import moondream as md
+        import torch
 
         logger.info("loading parakeet model=%s device=%s", self.model_name, self._device)
         started = time.monotonic()
         # Parakeet's single-pass runtime reserves a batch of 64 by default (~0.4 GB);
         # the hub is one request at a time (WHUB_MAX_CONCURRENCY), so a small batch
-        # fits the GPU budget with no measured latency change.
+        # fits the GPU budget with no measured latency change. fp16 halves the resident
+        # weights on CUDA; the CPU keeps the runtime's bf16 default because it has no
+        # fast fp16 path.
         model = md.photon(
-            self.model_name, device=self._device, single_pass_batch_capacity=2
+            self.model_name,
+            device=self._device,
+            single_pass_batch_capacity=2,
+            dtype=torch.float16 if self._device == "cuda" else torch.bfloat16,
         )
+        _warmup_parakeet(model)
         logger.info("loaded parakeet model=%s in %.1fs", self.model_name, time.monotonic() - started)
         return model
 
@@ -607,11 +720,17 @@ class WhisperEngine:
         *,
         prompt: str | None = None,
         language: str | None = None,
+        without_timestamps: bool = False,
     ) -> TranscriptionResult:
         with self._inflight_lock:
             self._inflight += 1
         try:
-            return self._transcribe_bytes(data, prompt=prompt, language=language)
+            return self._transcribe_bytes(
+                data,
+                prompt=prompt,
+                language=language,
+                without_timestamps=without_timestamps,
+            )
         finally:
             self.models.touch()
             touch = getattr(self.speech, "touch", None)
@@ -624,13 +743,16 @@ class WhisperEngine:
                 self.unload()
 
     def _transcribe_bytes(
-        self, data: bytes, *, prompt: str | None, language: str | None
+        self,
+        data: bytes,
+        *,
+        prompt: str | None,
+        language: str | None,
+        without_timestamps: bool,
     ) -> TranscriptionResult:
         self.models.touch()
         try:
-            from faster_whisper import decode_audio
-
-            audio = decode_audio(BytesIO(data), sampling_rate=16000)
+            audio = _decode_audio(data)
         except Exception as exc:
             raise DecodeError("could not decode audio") from exc
         finally:
@@ -644,9 +766,11 @@ class WhisperEngine:
                 prompt=prompt,
                 language_hint=language,
                 beam_size=self.config.beam_size,
+                translate_beam_size=self.config.translate_beam_size,
                 honor_client_language=self.config.honor_client_language,
                 lang_confidence=self.config.lang_confidence,
                 speech=self.speech,
+                without_timestamps=without_timestamps,
             )
         except DecodeError:
             raise
@@ -682,7 +806,12 @@ class EngineProtocol(Protocol):
     def models_loaded(self) -> bool: ...
 
     def transcribe_bytes(
-        self, data: bytes, *, prompt: str | None = None, language: str | None = None
+        self,
+        data: bytes,
+        *,
+        prompt: str | None = None,
+        language: str | None = None,
+        without_timestamps: bool = False,
     ) -> TranscriptionResult: ...
 
     def unload(self) -> bool: ...

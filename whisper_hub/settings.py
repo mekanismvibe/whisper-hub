@@ -23,6 +23,7 @@ SETTING_NAMES: tuple[str, ...] = (
     "compute_type",
     "cpu_threads",
     "beam_size",
+    "translate_beam_size",
     "max_concurrency",
     "model_idle_unload_seconds",
     "max_upload_mb",
@@ -69,7 +70,7 @@ def parse_value(field: str, raw: Any) -> Any:
         if isinstance(raw, bool):
             return raw
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-    if field in {"cpu_threads", "beam_size", "max_concurrency", "max_upload_mb"}:
+    if field in {"cpu_threads", "beam_size", "translate_beam_size", "max_concurrency", "max_upload_mb"}:
         return int(raw)
     if field in {"model_idle_unload_seconds", "lang_confidence"}:
         return float(raw)
@@ -125,6 +126,8 @@ def validate_values(values: dict[str, Any], *, check_models: bool = True) -> dic
         raise SettingsError("Device must be auto, cpu or cuda.")
     if int(cleaned["beam_size"]) < 1 or int(cleaned["beam_size"]) > 10:
         raise SettingsError("Beam size must be between 1 and 10.")
+    if int(cleaned["translate_beam_size"]) < 1 or int(cleaned["translate_beam_size"]) > 10:
+        raise SettingsError("Translation beam size must be between 1 and 10.")
     if int(cleaned["cpu_threads"]) < 0:
         raise SettingsError("CPU threads cannot be negative.")
     if not 1 <= int(cleaned["max_concurrency"]) <= 32:
